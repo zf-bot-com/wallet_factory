@@ -8,8 +8,8 @@
 
 如果不想自己搭建 golang 环境，直接用编译好的二进制文件即可。
 
-windows 下载地址：[wallet.exe]()
-mac 下载地址：[wallet-mac]()
+* windows 下载地址：[wallet.exe](https://github.com/zf-bot-com/wallet_factory/releases/download/v1.0/wallet.exe)
+* mac 下载地址：[wallet-mac](https://github.com/zf-bot-com/wallet_factory/releases/download/v1.0/wallet-mac)
 
 ## 使用方法
 
