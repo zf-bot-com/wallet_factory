@@ -1,0 +1,5 @@
+cache*
+.cursor*
+config.env
+*.tar.gz
+.DS_Store
