@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -398,9 +399,14 @@ func parseCustomFormat(format string) (prefix string, suffix string, err error) 
 
 func generateAddressByGPU(address string, prefixCount string, suffixCount string, quictCount string) (string, string, int64, error) {
 	// log.Printf("Generating address for %s, prefixCount=%s, suffixCount=%s\n", address, prefixCount, suffixCount)
-	exec_file := "./profanity.x64"
-	if os.IsPathSeparator('\\') {
+	var exec_file string
+	switch runtime.GOOS {
+	case "darwin":
+		exec_file = "./profanity.arm64"
+	case "windows":
 		exec_file = "./profanity.exe"
+	default:
+		exec_file = "./profanity.x64"
 	}
 
 	// 检查可执行文件是否存在

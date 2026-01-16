@@ -4,6 +4,9 @@ linux:
 win:
 	GOOS=windows GOARCH=amd64 go build -o factory-win.exe main.go
 
+mac:
+	GOOS=darwin GOARCH=amd64 go build -o factory-mac main.go
+
 init:
 	go clean -modcache
 	go mod init
@@ -34,6 +37,14 @@ tar-win:
 	cp factory-win.exe profanity.exe profanity.txt trap-factory-win/
 	tar -czvf trap-factory-win.tar.gz trap-factory-win
 	rm -rf trap-factory-win
+
+tar-mac:
+	rm -f trap-factory-mac.tar.gz
+	rm -rf trap-factory-mac
+	mkdir -p trap-factory-mac
+	cp factory-mac profanity.x64 profanity.txt trap-factory-mac/
+	tar -czvf trap-factory-mac.tar.gz trap-factory-mac
+	rm -rf trap-factory-mac
 
 deploy:
 	@echo "使用方法: ./deploy.sh [服务器地址] [服务器路径]"

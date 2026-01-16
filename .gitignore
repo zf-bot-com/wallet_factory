@@ -3,3 +3,4 @@ cache*
 config.env
 *.tar.gz
 .DS_Store
+config.env.prod
