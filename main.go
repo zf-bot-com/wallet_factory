@@ -65,6 +65,7 @@ type WorkerState struct {
 	isShuttingDown  bool
 	cancelRequested bool // 当前任务是否被请求取消
 	taskCancelFunc  context.CancelFunc // 任务取消函数
+	currentCmd      *exec.Cmd          // 当前正在执行的命令
 }
 
 func (ws *WorkerState) SetStatus(status WorkerStatus, taskID *string, taskType *string) {
@@ -104,6 +105,12 @@ func (ws *WorkerState) SetTaskCancelFunc(cancelFunc context.CancelFunc) {
 	ws.taskCancelFunc = cancelFunc
 }
 
+func (ws *WorkerState) SetCurrentCmd(cmd *exec.Cmd) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	ws.currentCmd = cmd
+}
+
 func (ws *WorkerState) CancelCurrentTask(taskID string) bool {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
@@ -111,6 +118,16 @@ func (ws *WorkerState) CancelCurrentTask(taskID string) bool {
 	// 检查是否是当前任务
 	if ws.currentTaskID != nil && *ws.currentTaskID == taskID {
 		ws.cancelRequested = true
+
+		// 终止正在运行的命令
+		if ws.currentCmd != nil && ws.currentCmd.Process != nil {
+			log.Printf("终止正在运行的命令进程: PID=%d\n", ws.currentCmd.Process.Pid)
+			if err := ws.currentCmd.Process.Kill(); err != nil {
+				log.Printf("终止命令进程失败: %v\n", err)
+			}
+		}
+
+		// 取消 context
 		if ws.taskCancelFunc != nil {
 			ws.taskCancelFunc()
 			log.Printf("任务已取消: TaskID=%s\n", taskID)
@@ -154,7 +171,12 @@ func sendHeartbeat(ctx context.Context, client *redis.Client, workerState *Worke
 		return fmt.Errorf("推送心跳到队列失败: %v", err)
 	}
 
-	log.Printf("心跳已发送: status=%s, taskId=%v\n", status, taskID)
+	// 格式化 taskID 用于日志输出
+	taskIDStr := "<nil>"
+	if taskID != nil {
+		taskIDStr = *taskID
+	}
+	log.Printf("心跳已发送: status=%s, taskId=%s\n", status, taskIDStr)
 	return nil
 }
 
@@ -544,7 +566,7 @@ func server() {
 			}
 
 			// 处理任务
-			privateKey, addr, totalGenerated, err := generateAddressByGPU(matchingAddress, prefixCount, suffixCount, "1")
+			privateKey, addr, totalGenerated, err := generateAddressByGPU(taskCtx, workerState, matchingAddress, prefixCount, suffixCount, "1")
 			if err != nil {
 				// 检查是否是因为取消导致的错误
 				if workerState.IsCancelRequested() {
@@ -669,7 +691,7 @@ func parseCustomFormat(format string) (prefix string, suffix string, err error) 
 	return prefix, suffix, nil
 }
 
-func generateAddressByGPU(address string, prefixCount string, suffixCount string, quictCount string) (string, string, int64, error) {
+func generateAddressByGPU(ctx context.Context, workerState *WorkerState, address string, prefixCount string, suffixCount string, quictCount string) (string, string, int64, error) {
 	// log.Printf("Generating address for %s, prefixCount=%s, suffixCount=%s\n", address, prefixCount, suffixCount)
 	var exec_file string
 	switch runtime.GOOS {
@@ -687,9 +709,22 @@ func generateAddressByGPU(address string, prefixCount string, suffixCount string
 	}
 
 	log.Printf("执行命令: %s --matching %s --prefix-count %s --suffix-count %s --quit-count %s", exec_file, address, prefixCount, suffixCount, quictCount)
-	cmd := exec.Command(exec_file, "--matching", address, "--prefix-count", prefixCount, "--suffix-count", suffixCount, "--quit-count", quictCount)
+
+	// 使用 CommandContext 创建可取消的命令
+	cmd := exec.CommandContext(ctx, exec_file, "--matching", address, "--prefix-count", prefixCount, "--suffix-count", suffixCount, "--quit-count", quictCount)
+
+	// 保存命令引用到 workerState
+	if workerState != nil {
+		workerState.SetCurrentCmd(cmd)
+		defer workerState.SetCurrentCmd(nil)
+	}
+
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		// 检查是否是因为取消导致的错误
+		if ctx.Err() == context.Canceled {
+			return "", "", 0, fmt.Errorf("命令已被取消")
+		}
 		return "", "", 0, fmt.Errorf("执行命令失败: %v, 输出: %s", err, string(output))
 	}
 
@@ -766,7 +801,7 @@ func main() {
 			postURL := config["POST_URL"]
 
 			for i := 0; i < intQuitCount; i++ {
-				privateKey, address, totalGenerated, err := generateAddressByGPU(fromAddress, prefixCount, suffixCount, "1")
+				privateKey, address, totalGenerated, err := generateAddressByGPU(context.Background(), nil, fromAddress, prefixCount, suffixCount, "1")
 				if err != nil {
 					log.Printf("Error generating address: %v\n", err)
 					return
