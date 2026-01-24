@@ -520,30 +520,9 @@ func server() {
 			var prefixCount, suffixCount string
 			var matchingAddress string
 
-			// 根据 taskType 决定生成策略
-			switch item.TaskType {
-			case "5a", "6a", "7a", "8a":
-				// 生成后 N 位相同的地址，例如 5a 表示后5位相同
-				suffixLen, err := strconv.Atoi(string(item.TaskType[0]))
-				if err != nil {
-					log.Printf("解析 taskType 失败: %v\n", err)
-					sendFailureResult(ctx, client, queueOutName, item.TaskID, fmt.Sprintf("解析 taskType 失败: %v", err))
-					return
-				}
-				suffixCount = strconv.Itoa(suffixLen)
-				prefixCount = "0"
-				// 直接使用 profanity.txt 文件作为匹配模式
-				matchingAddress = "./profanity.txt"
-				// 检查文件是否存在
-				if _, err := os.Stat(matchingAddress); os.IsNotExist(err) {
-					log.Printf("靓号模板文件不存在\n")
-					sendFailureResult(ctx, client, queueOutName, item.TaskID, "靓号模板文件不存在")
-					return
-				}
-
-			case "custom_address":
-				// ./profanity --matching <address> --prefix-count 4 --suffix-count 4 --quit-count 1
-				// 根据 customFormat 解析
+			// 优先检查是否有 customFormat
+			if item.CustomFormat != "" {
+				// 使用自定义格式
 				prefixStr, suffixStr, err := parseCustomFormat(item.CustomFormat)
 				if err != nil {
 					log.Printf("解析 customFormat 失败: %v\n", err)
@@ -560,11 +539,39 @@ func server() {
 					matchingAddress += "X"
 				}
 				matchingAddress += suffixStr
+			} else {
+				// 根据 taskType 决定生成策略
+				switch item.TaskType {
+				case "5a", "6a", "7a", "8a":
+					// 生成后 N 位相同的地址，例如 5a 表示后5位相同
+					suffixLen, err := strconv.Atoi(string(item.TaskType[0]))
+					if err != nil {
+						log.Printf("解析 taskType 失败: %v\n", err)
+						sendFailureResult(ctx, client, queueOutName, item.TaskID, fmt.Sprintf("解析 taskType 失败: %v", err))
+						return
+					}
+					suffixCount = strconv.Itoa(suffixLen)
+					prefixCount = "0"
+					// 直接使用 profanity.txt 文件作为匹配模式
+					matchingAddress = "./profanity.txt"
+					// 检查文件是否存在
+					if _, err := os.Stat(matchingAddress); os.IsNotExist(err) {
+						log.Printf("靓号模板文件不存在\n")
+						sendFailureResult(ctx, client, queueOutName, item.TaskID, "靓号模板文件不存在")
+						return
+					}
 
-			default:
-				log.Printf("未知的 taskType: %s\n", item.TaskType)
-				sendFailureResult(ctx, client, queueOutName, item.TaskID, fmt.Sprintf("未知的 taskType: %s", item.TaskType))
-				return
+				case "custom_address":
+					// custom_address 类型必须提供 customFormat
+					log.Printf("错误: taskType=custom_address 但未提供 customFormat\n")
+					sendFailureResult(ctx, client, queueOutName, item.TaskID, "taskType=custom_address 必须提供 customFormat 字段")
+					return
+
+				default:
+					log.Printf("未知的 taskType: %s\n", item.TaskType)
+					sendFailureResult(ctx, client, queueOutName, item.TaskID, fmt.Sprintf("未知的 taskType: %s", item.TaskType))
+					return
+				}
 			}
 
 			log.Printf("生成地址参数: matching=%s, prefixCount=%s, suffixCount=%s\n", matchingAddress, prefixCount, suffixCount)
