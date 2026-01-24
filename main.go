@@ -22,6 +22,9 @@ import (
 //go:embed config.env
 var envContent string
 
+// 任务处理超时时间（GPU 计算可能需要较长时间）
+var taskTimeout = 168 * time.Hour
+
 type Item struct {
 	TaskID       string `json:"taskId"`
 	TaskType     string `json:"taskType"`     // "5a", "6a", "7a", "8a", "custom_address"
@@ -164,9 +167,6 @@ func server() {
 	queueOutName := "address_consumer"
 	// 定义一个键，用于检查工作程序是否仍在运行
 	isWorkerAlive := "is_worker_alive"
-
-	// 任务处理超时时间（GPU 计算可能需要较长时间）
-	taskTimeout := 30 * time.Minute
 
 	log.Printf("开始监听队列: %s\n", queueInName)
 
@@ -334,9 +334,10 @@ func server() {
 			// 任务完成
 		case <-taskCtx.Done():
 			if taskCtx.Err() == context.DeadlineExceeded {
-				log.Printf("任务处理超时: TaskID=%s\n", taskID)
+				log.Printf("任务处理超时: TaskID=%s, 超时时间: %v\n", taskID, taskTimeout)
 				// 发送超时失败结果
-				sendFailureResult(ctx, client, queueOutName, taskID, "任务处理超时")
+				timeoutMsg := fmt.Sprintf("任务处理超时 > %v", taskTimeout)
+				sendFailureResult(ctx, client, queueOutName, taskID, timeoutMsg)
 			}
 		}
 	}
