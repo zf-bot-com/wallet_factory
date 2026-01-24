@@ -10,10 +10,13 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -25,10 +28,92 @@ var envContent string
 // 任务处理超时时间（GPU 计算可能需要较长时间）
 var taskTimeout = 168 * time.Hour
 
+// Worker 状态
+type WorkerStatus string
+
+const (
+	StatusIdle    WorkerStatus = "idle"
+	StatusBusy    WorkerStatus = "busy"
+	StatusOffline WorkerStatus = "offline"
+)
+
+// 心跳消息结构
+type Heartbeat struct {
+	WorkerID        string       `json:"workerId"`
+	Hostname        string       `json:"hostname"`
+	Status          WorkerStatus `json:"status"`
+	CurrentTaskID   *string      `json:"currentTaskId"`
+	CurrentTaskType *string      `json:"currentTaskType"`
+	Timestamp       string       `json:"timestamp"`
+}
+
+// Worker 状态管理
+type WorkerState struct {
+	mu              sync.RWMutex
+	workerId        string
+	hostname        string
+	status          WorkerStatus
+	currentTaskID   *string
+	currentTaskType *string
+	isShuttingDown  bool
+}
+
+func (ws *WorkerState) SetStatus(status WorkerStatus, taskID *string, taskType *string) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	ws.status = status
+	ws.currentTaskID = taskID
+	ws.currentTaskType = taskType
+}
+
+func (ws *WorkerState) GetStatus() (WorkerStatus, *string, *string) {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+	return ws.status, ws.currentTaskID, ws.currentTaskType
+}
+
+func (ws *WorkerState) SetShuttingDown(value bool) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	ws.isShuttingDown = value
+}
+
+func (ws *WorkerState) IsShuttingDown() bool {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+	return ws.isShuttingDown
+}
+
 type Item struct {
 	TaskID       string `json:"taskId"`
 	TaskType     string `json:"taskType"`     // "5a", "6a", "7a", "8a", "custom_address"
 	CustomFormat string `json:"customFormat"` // 例如 "TTTT-TTTT"
+}
+
+// sendHeartbeat 发送心跳到 Redis 队列
+func sendHeartbeat(ctx context.Context, client *redis.Client, workerState *WorkerState) error {
+	status, taskID, taskType := workerState.GetStatus()
+
+	heartbeat := Heartbeat{
+		WorkerID:        workerState.workerId,
+		Hostname:        workerState.hostname,
+		Status:          status,
+		CurrentTaskID:   taskID,
+		CurrentTaskType: taskType,
+		Timestamp:       time.Now().UTC().Format(time.RFC3339),
+	}
+
+	jsonBytes, err := json.Marshal(heartbeat)
+	if err != nil {
+		return fmt.Errorf("序列化心跳消息失败: %v", err)
+	}
+
+	if err := client.LPush(ctx, "worker_heartbeat", string(jsonBytes)).Err(); err != nil {
+		return fmt.Errorf("推送心跳到队列失败: %v", err)
+	}
+
+	log.Printf("心跳已发送: status=%s, taskId=%v\n", status, taskID)
+	return nil
 }
 
 type TaskResult struct {
@@ -162,26 +247,98 @@ func server() {
 	}
 	log.Printf("Redis 连接成功\n")
 
+	// 初始化 Worker 状态
+	hostname, err := os.Hostname()
+	if err != nil {
+		log.Printf("获取主机名失败: %v, 使用默认值\n", err)
+		hostname = "unknown"
+	}
+	workerId := fmt.Sprintf("worker-%s-%d", hostname, os.Getpid())
+
+	workerState := &WorkerState{
+		workerId: workerId,
+		hostname: hostname,
+		status:   StatusIdle,
+	}
+
+	log.Printf("Worker 启动: %s\n", workerId)
+
 	// 定义要监听的队列名称
 	queueInName := "address_producer"
 	queueOutName := "address_consumer"
-	// 定义一个键，用于检查工作程序是否仍在运行
-	isWorkerAlive := "is_worker_alive"
 
 	log.Printf("开始监听队列: %s\n", queueInName)
 
-	// 定期更新 worker 存活状态
+	// 发送初始心跳
+	if err := sendHeartbeat(ctx, client, workerState); err != nil {
+		log.Printf("发送初始心跳失败: %v\n", err)
+	}
+
+	// 定期发送心跳（每 30 秒）
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			if err := client.SetEX(ctx, isWorkerAlive, "1", 60*time.Second).Err(); err != nil {
-				log.Printf("更新 worker 存活状态失败: %v\n", err)
+			if err := sendHeartbeat(ctx, client, workerState); err != nil {
+				log.Printf("发送心跳失败: %v\n", err)
 			}
 		}
 	}()
 
+	// 设置优雅退出信号处理
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+
+	go func() {
+		sig := <-sigChan
+		log.Printf("收到退出信号: %v, 准备优雅退出...\n", sig)
+
+		// 标记为正在关闭
+		workerState.SetShuttingDown(true)
+
+		// 等待当前任务完成（最多等待 30 秒）
+		timeout := time.After(30 * time.Second)
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-timeout:
+				log.Printf("等待任务完成超时，强制退出\n")
+				goto exit
+			case <-ticker.C:
+				status, _, _ := workerState.GetStatus()
+				if status != StatusBusy {
+					log.Printf("当前无任务处理，可以安全退出\n")
+					goto exit
+				}
+				log.Printf("等待当前任务完成...\n")
+			}
+		}
+
+	exit:
+		// 发送离线心跳
+		workerState.SetStatus(StatusOffline, nil, nil)
+		if err := sendHeartbeat(ctx, client, workerState); err != nil {
+			log.Printf("发送离线心跳失败: %v\n", err)
+		}
+
+		// 关闭 Redis 连接
+		if err := client.Close(); err != nil {
+			log.Printf("关闭 Redis 连接失败: %v\n", err)
+		}
+
+		log.Printf("Worker 已安全退出\n")
+		os.Exit(0)
+	}()
+
 	for {
+		// 检查是否正在关闭
+		if workerState.IsShuttingDown() {
+			log.Printf("Worker 正在关闭，停止接收新任务\n")
+			break
+		}
+
 		// 使用 BRPop 阻塞式获取任务，超时时间 5 秒
 		// 这样比轮询 RPop + Sleep 更高效
 		result, err := client.BRPop(ctx, 5*time.Second, queueInName).Result()
@@ -229,8 +386,18 @@ func server() {
 					// 发送失败结果
 					sendFailureResult(ctx, client, queueOutName, item.TaskID, fmt.Sprintf("panic: %v", r))
 				}
+				// 恢复空闲状态
+				workerState.SetStatus(StatusIdle, nil, nil)
+				sendHeartbeat(ctx, client, workerState)
 				done <- true
 			}()
+
+			// 更新状态为忙碌
+			workerState.SetStatus(StatusBusy, &item.TaskID, &item.TaskType)
+			// 立即发送心跳
+			if err := sendHeartbeat(ctx, client, workerState); err != nil {
+				log.Printf("发送忙碌心跳失败: %v\n", err)
+			}
 
 			var prefixCount, suffixCount string
 			var matchingAddress string
