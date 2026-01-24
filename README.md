@@ -150,6 +150,20 @@ ssh gpu 'sudo cp /tmp/trap-factory.conf /etc/supervisor/conf.d/ && sudo supervis
 
 作为服务器模式运行，从 Redis 队列中获取任务并处理。
 
+#### Worker 心跳机制
+
+本程序实现了完整的 Worker 心跳机制，用于与主系统进行状态同步：
+
+- **心跳频率**: 每 30 秒自动发送一次心跳
+- **心跳队列**: `worker_heartbeat`（Redis List）
+- **Worker 状态**:
+  - `idle`: 空闲（在线但未处理任务）
+  - `busy`: 忙碌（正在处理任务）
+  - `offline`: 离线（准备退出）
+- **优雅退出**: 支持 SIGTERM/SIGINT 信号，会等待当前任务完成后安全退出
+
+详细的心跳机制说明请参考 [HEARTBEAT_IMPLEMENTATION.md](HEARTBEAT_IMPLEMENTATION.md)。
+
 **配置说明：**
 
 Redis 连接配置存储在 `config.env` 文件中，使用 `go:embed` 在编译时嵌入到二进制文件中。这样打包后的可执行文件包含了配置信息，无需额外的配置文件。
@@ -224,7 +238,16 @@ make server
 - 确保 Redis 服务器可访问
 - 确保 `profanity.x64`（Linux）或 `profanity.exe`（Windows）可执行文件存在
 - 确保 `profanity.txt` 文件存在（用于 `5a`/`6a`/`7a`/`8a` 任务类型）
-- 任务处理超时时间为 30 分钟
+- 任务处理超时时间为 168 小时（7 天）
+- Worker 会自动发送心跳到 `worker_heartbeat` 队列
+- 支持优雅退出（Ctrl+C 或 kill 命令）
+
+**测试心跳功能：**
+
+```bash
+# 运行心跳测试脚本
+./scripts/test_heartbeat.sh
+```
 
 ## 注意事项
 
