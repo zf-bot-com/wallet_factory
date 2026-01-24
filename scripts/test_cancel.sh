@@ -68,9 +68,9 @@ else
     echo "   ⚠ Worker 可能未开始处理任务"
 fi
 
-# 发送取消通知
+# 发送取消通知（使用 PUBLISH）
 echo ""
-echo "8. 发送任务取消通知..."
+echo "8. 发送任务取消通知（使用 Pub/Sub）..."
 CANCEL_JSON=$(cat <<EOF
 {
   "action": "cancel",
@@ -79,8 +79,8 @@ CANCEL_JSON=$(cat <<EOF
 }
 EOF
 )
-redis-cli LPUSH task_cancel_notifications "$CANCEL_JSON" > /dev/null
-echo "   ✓ 取消通知已发送"
+redis-cli PUBLISH task_cancel_channel "$CANCEL_JSON" > /dev/null
+echo "   ✓ 取消通知已广播"
 
 # 等待 3 秒让取消生效
 echo ""

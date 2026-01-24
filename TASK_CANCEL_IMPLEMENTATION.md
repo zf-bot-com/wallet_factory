@@ -8,7 +8,12 @@
 
 ### 1. 取消通知监听
 
-Worker 启动后会自动监听 `task_cancel_notifications` 队列，接收来自主系统的取消通知。
+Worker 启动后会自动订阅 `task_cancel_channel` 频道（Redis Pub/Sub），接收来自主系统的取消通知。
+
+**优势**：
+- 使用 Pub/Sub 机制，取消通知可以广播到所有 Worker
+- 实时性更好，无需轮询
+- 不会遗漏消息
 
 ### 2. 取消通知格式
 
@@ -27,11 +32,13 @@ Worker 启动后会自动监听 `task_cancel_notifications` 队列，接收来�
 
 ### 3. 取消处理流程
 
-1. Worker 从 `task_cancel_notifications` 队列接收取消通知
-2. 检查通知中的 taskId 是否与当前正在处理的任务匹配
-3. 如果匹配，立即取消任务执行
-4. 发送失败结果到 `address_consumer` 队列，状态为 "failed"，错误信息为 "任务已被用户取消"
-5. Worker 恢复空闲状态，可以接收新任务
+1. Worker 订阅 `task_cancel_channel` 频道
+2. 主系统通过 `PUBLISH` 广播取消通知
+3. 所有订阅的 Worker 同时收到通知
+4. Worker 检查通知中的 taskId 是否与当前正在处理的任务匹配
+5. 如果匹配，立即取消任务执行
+6. 发送失败结果到 `address_consumer` 队列，状态为 "failed"，错误信息为 "任务已被用户取消"
+7. Worker 恢复空闲状态，可以接收新任务
 
 ### 4. 取消时机
 
@@ -117,21 +124,40 @@ func (ws *WorkerState) IsCancelRequested() bool
 
 ### 监听取消通知
 
-Worker 启动时会创建一个 goroutine 监听取消通知：
+Worker 启动时会创建一个 goroutine 订阅取消频道：
 
 ```go
 go func() {
+    // 创建 Pub/Sub 订阅
+    pubsub := client.Subscribe(ctx, "task_cancel_channel")
+    defer pubsub.Close()
+
+    // 等待订阅确认
+    _, err := pubsub.Receive(ctx)
+    if err != nil {
+        log.Printf("订阅取消频道失败: %v\n", err)
+        return
+    }
+    log.Printf("已订阅任务取消频道: task_cancel_channel\n")
+
+    // 获取消息频道
+    ch := pubsub.Channel()
+
     for {
-        // 阻塞式获取取消通知
-        result, err := client.BRPop(ctx, 5*time.Second, "task_cancel_notifications").Result()
+        select {
+        case msg := <-ch:
+            // 解析取消通知
+            var cancelNotif CancelNotification
+            json.Unmarshal([]byte(msg.Payload), &cancelNotif)
 
-        // 解析取消通知
-        var cancelNotif CancelNotification
-        json.Unmarshal([]byte(result[1]), &cancelNotif)
+            // 处理取消请求
+            if cancelNotif.Action == "cancel" {
+                workerState.CancelCurrentTask(cancelNotif.TaskID)
+            }
 
-        // 处理取消请求
-        if cancelNotif.Action == "cancel" {
-            workerState.CancelCurrentTask(cancelNotif.TaskID)
+        case <-time.After(5 * time.Second):
+            // 定期检查是否需要退出
+            continue
         }
     }
 }()
@@ -177,7 +203,14 @@ const cancelMessage = {
   timestamp: new Date().toISOString(),
 };
 
-await redis.lpush('task_cancel_notifications', JSON.stringify(cancelMessage));
+// 使用 PUBLISH 广播到所有 Worker
+await redis.publish('task_cancel_channel', JSON.stringify(cancelMessage));
+logger.info(`任务取消通知已广播到所有 Worker: ${taskId}`);
+```
+
+**Redis 命令行测试**：
+```bash
+redis-cli PUBLISH task_cancel_channel '{"action":"cancel","taskId":"test-123","timestamp":"2026-01-24T13:00:00Z"}'
 ```
 
 ### 取消结果
@@ -225,8 +258,8 @@ redis-cli LPUSH address_producer '{"taskId":"test-123","taskType":"8a","customFo
 
 # 3. 等待任务开始处理（查看日志）
 
-# 4. 发送取消通知
-redis-cli LPUSH task_cancel_notifications '{"action":"cancel","taskId":"test-123","timestamp":"2026-01-24T13:00:00Z"}'
+# 4. 发送取消通知（使用 PUBLISH）
+redis-cli PUBLISH task_cancel_channel '{"action":"cancel","taskId":"test-123","timestamp":"2026-01-24T13:00:00Z"}'
 
 # 5. 查看结果
 redis-cli LRANGE address_consumer 0 0
@@ -237,6 +270,8 @@ redis-cli LRANGE address_consumer 0 0
 ### 正常取消流程
 
 ```
+Worker 启动: worker-MacBook-Pro.local
+已订阅任务取消频道: task_cancel_channel
 收到任务: TaskID=test-123, TaskType=8a, CustomFormat=
 心跳已发送: status=busy, taskId=test-123
 执行命令: ./profanity.arm64 --matching ...
@@ -260,9 +295,10 @@ redis-cli LRANGE address_consumer 0 0
 
 1. **取消时机**: 只能取消当前正在处理的任务，已完成或未开始的任务无法取消
 2. **取消延迟**: 取消操作可能需要几秒钟才能生效，取决于任务的执行状态
-3. **GPU 任务**: 对于 GPU 计算任务，取消操作会通过 context 传递，但实际中断时间取决于 GPU 程序的实现
+3. **GPU 任务**: 对于 GPU 计算任务，取消操作会通过 context 传递，并终止进程
 4. **并发安全**: 所有取消操作都是线程安全的，可以在任何时候调用
-5. **取消通知**: 取消通知会被立即消费，不会重复处理
+5. **广播机制**: 使用 Pub/Sub 广播，所有 Worker 都会收到通知，但只有处理该任务的 Worker 会执行取消
+6. **订阅确认**: Worker 启动时会等待订阅确认，确保不会遗漏消息
 
 ## 与心跳机制的集成
 

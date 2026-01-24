@@ -350,43 +350,53 @@ func server() {
 		}
 	}()
 
-	// 监听任务取消通知
+	// 监听任务取消通知（使用 Pub/Sub）
 	go func() {
+		// 创建 Pub/Sub 订阅
+		pubsub := client.Subscribe(ctx, "task_cancel_channel")
+		defer pubsub.Close()
+
+		// 等待订阅确认
+		_, err := pubsub.Receive(ctx)
+		if err != nil {
+			log.Printf("订阅取消频道失败: %v\n", err)
+			return
+		}
+		log.Printf("已订阅任务取消频道: task_cancel_channel\n")
+
+		// 获取消息频道
+		ch := pubsub.Channel()
+
 		for {
 			// 检查是否正在关闭
 			if workerState.IsShuttingDown() {
 				break
 			}
 
-			// 阻塞式获取取消通知，超时 5 秒
-			result, err := client.BRPop(ctx, 5*time.Second, "task_cancel_notifications").Result()
-			if err == redis.Nil {
-				// 超时，继续循环
-				continue
-			} else if err != nil {
-				log.Printf("获取取消通知失败: %v\n", err)
-				time.Sleep(5 * time.Second)
-				continue
-			}
-
-			// result[0] 是队列名，result[1] 是消息数据
-			if len(result) < 2 {
-				continue
-			}
-
-			var cancelNotif CancelNotification
-			if err := json.Unmarshal([]byte(result[1]), &cancelNotif); err != nil {
-				log.Printf("解析取消通知失败: %v, 数据: %s\n", err, result[1])
-				continue
-			}
-
-			if cancelNotif.Action == "cancel" {
-				log.Printf("收到任务取消通知: TaskID=%s\n", cancelNotif.TaskID)
-				if workerState.CancelCurrentTask(cancelNotif.TaskID) {
-					log.Printf("任务取消成功: TaskID=%s\n", cancelNotif.TaskID)
-				} else {
-					log.Printf("任务取消失败（可能不是当前任务）: TaskID=%s\n", cancelNotif.TaskID)
+			select {
+			case msg := <-ch:
+				if msg == nil {
+					continue
 				}
+
+				var cancelNotif CancelNotification
+				if err := json.Unmarshal([]byte(msg.Payload), &cancelNotif); err != nil {
+					log.Printf("解析取消通知失败: %v, 数据: %s\n", err, msg.Payload)
+					continue
+				}
+
+				if cancelNotif.Action == "cancel" {
+					log.Printf("收到任务取消通知: TaskID=%s\n", cancelNotif.TaskID)
+					if workerState.CancelCurrentTask(cancelNotif.TaskID) {
+						log.Printf("任务取消成功: TaskID=%s\n", cancelNotif.TaskID)
+					} else {
+						log.Printf("任务取消失败（可能不是当前任务）: TaskID=%s\n", cancelNotif.TaskID)
+					}
+				}
+
+			case <-time.After(5 * time.Second):
+				// 定期检查是否需要退出
+				continue
 			}
 		}
 	}()
