@@ -38,8 +38,12 @@ Worker 启动后会自动监听 `task_cancel_notifications` 队列，接收来�
 任务可以在以下时机被取消：
 
 - **任务开始前**: 检查取消标志
-- **任务执行中**: 通过 context.Cancel() 中断执行
+- **任务执行中**:
+  - 通过 `context.Cancel()` 中断执行
+  - 通过 `Process.Kill()` 终止正在运行的 GPU 命令进程
 - **任务执行后**: 检查取消标志
+
+**命令进程终止**：当任务被取消时，Worker 会立即调用 `cmd.Process.Kill()` 终止正在运行的 GPU 命令进程，确保任务能够被真正终止，而不是继续在后台运行。
 
 ### 5. 线程安全
 
@@ -68,10 +72,19 @@ type WorkerState struct {
     isShuttingDown  bool
     cancelRequested bool              // 当前任务是否被请求取消
     taskCancelFunc  context.CancelFunc // 任务取消函数
+    currentCmd      *exec.Cmd          // 当前正在执行的命令
 }
 ```
 
 ### 核心方法
+
+#### SetCurrentCmd
+
+设置当前正在执行的命令：
+
+```go
+func (ws *WorkerState) SetCurrentCmd(cmd *exec.Cmd)
+```
 
 #### CancelCurrentTask
 
@@ -82,8 +95,17 @@ func (ws *WorkerState) CancelCurrentTask(taskID string) bool
 ```
 
 - 检查 taskID 是否与当前任务匹配
-- 如果匹配，设置取消标志并调用 context.CancelFunc
+- 如果匹配：
+  1. 设置取消标志
+  2. 终止正在运行的命令进程（`cmd.Process.Kill()`）
+  3. 调用 context.CancelFunc
 - 返回是否成功取消
+
+**进程终止日志**：
+```
+终止正在运行的命令进程: PID=12345
+任务已取消: TaskID=task-123
+```
 
 #### IsCancelRequested
 
@@ -217,7 +239,9 @@ redis-cli LRANGE address_consumer 0 0
 ```
 收到任务: TaskID=test-123, TaskType=8a, CustomFormat=
 心跳已发送: status=busy, taskId=test-123
+执行命令: ./profanity.arm64 --matching ...
 收到任务取消通知: TaskID=test-123
+终止正在运行的命令进程: PID=12345
 任务已取消: TaskID=test-123
 任务取消成功: TaskID=test-123
 任务已被取消: TaskID=test-123
