@@ -10,8 +10,14 @@
 
 每个 Worker 实例都有唯一的标识：
 
-- **workerId**: 格式为 `worker-{hostname}-{pid}`
+- **workerId**: 格式为 `worker-{hostname}`（例如：`worker-MacBook-Pro.local`）
 - **hostname**: 从系统获取的主机名
+
+**优点**：
+- 简单直接
+- 重启后 ID 保持不变
+- 适合每台机器只运行一个 Worker
+- 便于识别和管理
 
 ### 2. 心跳机制
 
@@ -114,8 +120,8 @@ func sendHeartbeat(ctx context.Context, client *redis.Client, workerState *Worke
 **空闲状态**:
 ```json
 {
-  "workerId": "worker-MacBook-Pro-12345",
-  "hostname": "MacBook-Pro",
+  "workerId": "worker-MacBook-Pro.local",
+  "hostname": "MacBook-Pro.local",
   "status": "idle",
   "currentTaskId": null,
   "currentTaskType": null,
@@ -126,8 +132,8 @@ func sendHeartbeat(ctx context.Context, client *redis.Client, workerState *Worke
 **忙碌状态**:
 ```json
 {
-  "workerId": "worker-MacBook-Pro-12345",
-  "hostname": "MacBook-Pro",
+  "workerId": "worker-MacBook-Pro.local",
+  "hostname": "MacBook-Pro.local",
   "status": "busy",
   "currentTaskId": "task-uuid-12345",
   "currentTaskType": "5a",
@@ -138,8 +144,8 @@ func sendHeartbeat(ctx context.Context, client *redis.Client, workerState *Worke
 **离线状态**:
 ```json
 {
-  "workerId": "worker-MacBook-Pro-12345",
-  "hostname": "MacBook-Pro",
+  "workerId": "worker-MacBook-Pro.local",
+  "hostname": "MacBook-Pro.local",
   "status": "offline",
   "currentTaskId": null,
   "currentTaskType": null,
@@ -167,7 +173,7 @@ redis-cli LRANGE worker_heartbeat 0 9
 Worker 运行时会输出以下日志：
 
 ```
-Worker 启动: worker-MacBook-Pro-12345
+Worker 启动: worker-MacBook-Pro.local
 Redis 连接成功
 开始监听队列: address_producer
 心跳已发送: status=idle, taskId=<nil>

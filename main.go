@@ -317,7 +317,8 @@ func server() {
 		log.Printf("获取主机名失败: %v, 使用默认值\n", err)
 		hostname = "unknown"
 	}
-	workerId := fmt.Sprintf("worker-%s-%d", hostname, os.Getpid())
+	// 只使用主机名作为 workerId，重启后 ID 保持不变
+	workerId := fmt.Sprintf("worker-%s", hostname)
 
 	workerState := &WorkerState{
 		workerId: workerId,
