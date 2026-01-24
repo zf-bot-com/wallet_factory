@@ -47,6 +47,13 @@ type Heartbeat struct {
 	Timestamp       string       `json:"timestamp"`
 }
 
+// 取消通知消息结构
+type CancelNotification struct {
+	Action    string `json:"action"`
+	TaskID    string `json:"taskId"`
+	Timestamp string `json:"timestamp"`
+}
+
 // Worker 状态管理
 type WorkerState struct {
 	mu              sync.RWMutex
@@ -56,6 +63,8 @@ type WorkerState struct {
 	currentTaskID   *string
 	currentTaskType *string
 	isShuttingDown  bool
+	cancelRequested bool // 当前任务是否被请求取消
+	taskCancelFunc  context.CancelFunc // 任务取消函数
 }
 
 func (ws *WorkerState) SetStatus(status WorkerStatus, taskID *string, taskType *string) {
@@ -64,6 +73,11 @@ func (ws *WorkerState) SetStatus(status WorkerStatus, taskID *string, taskType *
 	ws.status = status
 	ws.currentTaskID = taskID
 	ws.currentTaskType = taskType
+	// 切换任务时重置取消标志
+	if taskID == nil {
+		ws.cancelRequested = false
+		ws.taskCancelFunc = nil
+	}
 }
 
 func (ws *WorkerState) GetStatus() (WorkerStatus, *string, *string) {
@@ -82,6 +96,34 @@ func (ws *WorkerState) IsShuttingDown() bool {
 	ws.mu.RLock()
 	defer ws.mu.RUnlock()
 	return ws.isShuttingDown
+}
+
+func (ws *WorkerState) SetTaskCancelFunc(cancelFunc context.CancelFunc) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	ws.taskCancelFunc = cancelFunc
+}
+
+func (ws *WorkerState) CancelCurrentTask(taskID string) bool {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	// 检查是否是当前任务
+	if ws.currentTaskID != nil && *ws.currentTaskID == taskID {
+		ws.cancelRequested = true
+		if ws.taskCancelFunc != nil {
+			ws.taskCancelFunc()
+			log.Printf("任务已取消: TaskID=%s\n", taskID)
+			return true
+		}
+	}
+	return false
+}
+
+func (ws *WorkerState) IsCancelRequested() bool {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+	return ws.cancelRequested
 }
 
 type Item struct {
@@ -285,6 +327,47 @@ func server() {
 		}
 	}()
 
+	// 监听任务取消通知
+	go func() {
+		for {
+			// 检查是否正在关闭
+			if workerState.IsShuttingDown() {
+				break
+			}
+
+			// 阻塞式获取取消通知，超时 5 秒
+			result, err := client.BRPop(ctx, 5*time.Second, "task_cancel_notifications").Result()
+			if err == redis.Nil {
+				// 超时，继续循环
+				continue
+			} else if err != nil {
+				log.Printf("获取取消通知失败: %v\n", err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+
+			// result[0] 是队列名，result[1] 是消息数据
+			if len(result) < 2 {
+				continue
+			}
+
+			var cancelNotif CancelNotification
+			if err := json.Unmarshal([]byte(result[1]), &cancelNotif); err != nil {
+				log.Printf("解析取消通知失败: %v, 数据: %s\n", err, result[1])
+				continue
+			}
+
+			if cancelNotif.Action == "cancel" {
+				log.Printf("收到任务取消通知: TaskID=%s\n", cancelNotif.TaskID)
+				if workerState.CancelCurrentTask(cancelNotif.TaskID) {
+					log.Printf("任务取消成功: TaskID=%s\n", cancelNotif.TaskID)
+				} else {
+					log.Printf("任务取消失败（可能不是当前任务）: TaskID=%s\n", cancelNotif.TaskID)
+				}
+			}
+		}
+	}()
+
 	// 设置优雅退出信号处理
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
@@ -372,14 +455,14 @@ func server() {
 
 		log.Printf("收到任务: TaskID=%s, TaskType=%s, CustomFormat=%s\n", item.TaskID, item.TaskType, item.CustomFormat)
 
-		// 创建带超时的上下文处理任务
-		taskCtx, cancel := context.WithTimeout(ctx, taskTimeout)
+		// 创建带超时和可取消的上下文处理任务
+		taskCtx, taskCancel := context.WithTimeout(ctx, taskTimeout)
 
 		// 使用 channel 来等待任务完成
 		done := make(chan bool, 1)
 
 		go func(item Item) {
-			defer cancel()
+			defer taskCancel()
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("任务处理发生 panic: %v\n", r)
@@ -394,6 +477,8 @@ func server() {
 
 			// 更新状态为忙碌
 			workerState.SetStatus(StatusBusy, &item.TaskID, &item.TaskType)
+			// 保存任务取消函数
+			workerState.SetTaskCancelFunc(taskCancel)
 			// 立即发送心跳
 			if err := sendHeartbeat(ctx, client, workerState); err != nil {
 				log.Printf("发送忙碌心跳失败: %v\n", err)
@@ -451,9 +536,22 @@ func server() {
 
 			log.Printf("生成地址参数: matching=%s, prefixCount=%s, suffixCount=%s\n", matchingAddress, prefixCount, suffixCount)
 
+			// 检查任务是否被取消
+			if workerState.IsCancelRequested() {
+				log.Printf("任务已被取消: TaskID=%s\n", item.TaskID)
+				sendFailureResult(ctx, client, queueOutName, item.TaskID, "任务已被用户取消")
+				return
+			}
+
 			// 处理任务
 			privateKey, addr, totalGenerated, err := generateAddressByGPU(matchingAddress, prefixCount, suffixCount, "1")
 			if err != nil {
+				// 检查是否是因为取消导致的错误
+				if workerState.IsCancelRequested() {
+					log.Printf("任务已被取消: TaskID=%s\n", item.TaskID)
+					sendFailureResult(ctx, client, queueOutName, item.TaskID, "任务已被用户取消")
+					return
+				}
 				log.Printf("生成地址失败: TaskID=%s, 错误: %v\n", item.TaskID, err)
 				sendFailureResult(ctx, client, queueOutName, item.TaskID, err.Error())
 				return
@@ -494,7 +592,7 @@ func server() {
 			}
 		}(item)
 
-		// 等待任务完成或超时
+		// 等待任务完成或超时或取消
 		taskID := item.TaskID // 保存 taskID 用于超时日志
 		select {
 		case <-done:
@@ -505,6 +603,12 @@ func server() {
 				// 发送超时失败结果
 				timeoutMsg := fmt.Sprintf("任务处理超时 > %v", taskTimeout)
 				sendFailureResult(ctx, client, queueOutName, taskID, timeoutMsg)
+			} else if taskCtx.Err() == context.Canceled {
+				// 任务被取消
+				if workerState.IsCancelRequested() {
+					log.Printf("任务已被取消: TaskID=%s\n", taskID)
+					sendFailureResult(ctx, client, queueOutName, taskID, "任务已被用户取消")
+				}
 			}
 		}
 	}

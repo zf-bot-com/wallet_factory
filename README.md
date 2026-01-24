@@ -164,6 +164,17 @@ ssh gpu 'sudo cp /tmp/trap-factory.conf /etc/supervisor/conf.d/ && sudo supervis
 
 详细的心跳机制说明请参考 [HEARTBEAT_IMPLEMENTATION.md](HEARTBEAT_IMPLEMENTATION.md)。
 
+#### 任务取消机制
+
+本程序支持通过 Redis 通知取消正在处理的任务：
+
+- **取消队列**: `task_cancel_notifications`（Redis List）
+- **取消通知格式**: JSON 格式，包含 action、taskId、timestamp
+- **取消时机**: 可以在任务执行的任何阶段取消
+- **取消结果**: 任务会被标记为失败，错误信息为 "任务已被用户取消"
+
+详细的取消机制说明请参考 [TASK_CANCEL_IMPLEMENTATION.md](TASK_CANCEL_IMPLEMENTATION.md)。
+
 **配置说明：**
 
 Redis 连接配置存储在 `config.env` 文件中，使用 `go:embed` 在编译时嵌入到二进制文件中。这样打包后的可执行文件包含了配置信息，无需额外的配置文件。
@@ -247,6 +258,13 @@ make server
 ```bash
 # 运行心跳测试脚本
 ./scripts/test_heartbeat.sh
+```
+
+**测试任务取消功能：**
+
+```bash
+# 运行任务取消测试脚本
+./scripts/test_cancel.sh
 ```
 
 ## 注意事项
