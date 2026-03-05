@@ -1,11 +1,29 @@
-linux:
+# 环境变量，默认为 dev
+ENV ?= dev
+
+# 切换环境配置：将 config.env.$(ENV) 复制到 config.env
+switch-env:
+	@if [ ! -f "config.env.$(ENV)" ]; then \
+		echo "❌ 配置文件不存在: config.env.$(ENV)"; \
+		exit 1; \
+	fi
+	@cp config.env.$(ENV) config.env
+	@echo "✅ 已切换到 $(ENV) 环境配置"
+
+linux: switch-env
+	@echo "编译 Linux 版本 (环境: $(ENV))..."
 	GOOS=linux GOARCH=amd64 go build -o factory-linux main.go
+	@echo "✅ 编译完成: factory-linux ($(ENV))"
 
 win:
+	@echo "编译 Windows 版本 (环境: $(ENV))..."
 	GOOS=windows GOARCH=amd64 go build -o factory-win.exe main.go
+	@echo "✅ 编译完成: factory-win.exe ($(ENV))"
 
 mac:
+	@echo "编译 macOS 版本 (环境: $(ENV))..."
 	GOOS=darwin GOARCH=amd64 go build -o factory-mac main.go
+	@echo "✅ 编译完成: factory-mac ($(ENV))"
 
 init:
 	go clean -modcache

@@ -1,0 +1,23 @@
+[Unit]
+Description=GPU Driver Status Monitor
+Documentation=file:///srv/trap_factory/docs/GPU_DRIVER_MAINTENANCE.md
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/srv/trap_factory/scripts/monitor_gpu.sh monitor
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# 安全设置
+User=root
+Group=root
+
+# 资源限制
+CPUQuota=5%
+MemoryLimit=100M
+
+[Install]
+WantedBy=multi-user.target

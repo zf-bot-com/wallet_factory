@@ -63,7 +63,7 @@ type WorkerState struct {
 	currentTaskID   *string
 	currentTaskType *string
 	isShuttingDown  bool
-	cancelRequested bool // 当前任务是否被请求取消
+	cancelRequested bool               // 当前任务是否被请求取消
 	taskCancelFunc  context.CancelFunc // 任务取消函数
 	currentCmd      *exec.Cmd          // 当前正在执行的命令
 }
@@ -224,6 +224,25 @@ func sendFailureResult(ctx context.Context, client *redis.Client, queueOutName s
 	}
 }
 
+// RedisConfig Redis 连接配置
+type RedisConfig struct {
+	ID           int           // Redis 实例编号
+	Addr         string        // Redis 地址
+	Password     string        // Redis 密码
+	DB           int           // Redis 数据库
+	PoolSize     int           // 连接池大小
+	MinIdleConns int           // 最小空闲连接数
+	DialTimeout  time.Duration // 连接超时
+	ReadTimeout  time.Duration // 读取超时
+	WriteTimeout time.Duration // 写入超时
+}
+
+// RedisClientWrapper 封装 Redis 客户端及其配置
+type RedisClientWrapper struct {
+	Config *RedisConfig
+	Client *redis.Client
+}
+
 // loadEnvConfig 从嵌入的 env 内容中加载配置
 func loadEnvConfig() map[string]string {
 	config := make(map[string]string)
@@ -243,6 +262,81 @@ func loadEnvConfig() map[string]string {
 	return config
 }
 
+// parseRedisConfigs 从配置中解析多个 Redis 配置
+func parseRedisConfigs(config map[string]string) []*RedisConfig {
+	redisConfigs := make(map[int]*RedisConfig)
+
+	// 遍历配置，找出所有 REDIS_<N>_* 的配置项
+	for key, value := range config {
+		if !strings.HasPrefix(key, "REDIS_") {
+			continue
+		}
+
+		// 解析格式：REDIS_<N>_<FIELD>
+		parts := strings.Split(key, "_")
+		if len(parts) < 3 {
+			continue
+		}
+
+		// 获取 Redis 实例编号
+		id, err := strconv.Atoi(parts[1])
+		if err != nil {
+			continue
+		}
+
+		// 确保该 ID 的配置对象存在
+		if _, exists := redisConfigs[id]; !exists {
+			redisConfigs[id] = &RedisConfig{
+				ID:           id,
+				PoolSize:     10,
+				MinIdleConns: 5,
+				DialTimeout:  5 * time.Second,
+				ReadTimeout:  3 * time.Second,
+				WriteTimeout: 3 * time.Second,
+			}
+		}
+
+		// 解析配置字段
+		field := strings.Join(parts[2:], "_")
+		switch field {
+		case "ADDR":
+			redisConfigs[id].Addr = value
+		case "PASSWORD":
+			redisConfigs[id].Password = value
+		case "DB":
+			if db, err := strconv.Atoi(value); err == nil {
+				redisConfigs[id].DB = db
+			}
+		case "POOL_SIZE":
+			if ps, err := strconv.Atoi(value); err == nil {
+				redisConfigs[id].PoolSize = ps
+			}
+		case "MIN_IDLE_CONNS":
+			if mic, err := strconv.Atoi(value); err == nil {
+				redisConfigs[id].MinIdleConns = mic
+			}
+		case "DIAL_TIMEOUT":
+			redisConfigs[id].DialTimeout = parseDuration(value)
+		case "READ_TIMEOUT":
+			redisConfigs[id].ReadTimeout = parseDuration(value)
+		case "WRITE_TIMEOUT":
+			redisConfigs[id].WriteTimeout = parseDuration(value)
+		}
+	}
+
+	// 转换为切片并按 ID 排序
+	var result []*RedisConfig
+	for i := 1; i <= len(redisConfigs)+10; i++ { // +10 防止编号不连续
+		if cfg, exists := redisConfigs[i]; exists {
+			if cfg.Addr != "" { // 只添加配置了地址的实例
+				result = append(result, cfg)
+			}
+		}
+	}
+
+	return result
+}
+
 // parseDuration 解析时间字符串，支持 "5s", "3s" 等格式
 func parseDuration(s string) time.Duration {
 	d, err := time.ParseDuration(s)
@@ -253,71 +347,283 @@ func parseDuration(s string) time.Duration {
 	return d
 }
 
-func server() {
-	// 从嵌入的 config.env 加载配置
-	config := loadEnvConfig()
+// checkGPUEnvironment 检查 GPU 环境是否正确配置
+// processTask 处理单个任务
+func processTask(ctx context.Context, client *redis.Client, workerState *WorkerState, item Item, queueOutName string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("任务处理发生 panic: %v\n", r)
+			sendFailureResult(ctx, client, queueOutName, item.TaskID, fmt.Sprintf("panic: %v", r))
+		}
+		workerState.SetStatus(StatusIdle, nil, nil)
+		sendHeartbeat(ctx, client, workerState)
+	}()
 
-	// 获取配置值，如果不存在则使用默认值
-	redisAddr := config["REDIS_ADDR"]
-	if redisAddr == "" {
-		log.Fatal("REDIS_ADDR 未配置")
+	workerState.SetStatus(StatusBusy, &item.TaskID, &item.TaskType)
+	workerState.SetTaskCancelFunc(nil)
+	if err := sendHeartbeat(ctx, client, workerState); err != nil {
+		log.Printf("发送忙碌心跳失败: %v\n", err)
 	}
 
-	// Redis 密码可选，如果为空则不使用密码
-	redisPassword := config["REDIS_PASSWORD"]
+	var prefixCount, suffixCount string
+	var matchingAddress string
 
-	redisDB := 0
-	if dbStr := config["REDIS_DB"]; dbStr != "" {
-		if db, err := strconv.Atoi(dbStr); err == nil {
-			redisDB = db
+	if item.CustomFormat != "" {
+		prefixStr, suffixStr, err := parseCustomFormat(item.CustomFormat)
+		if err != nil {
+			log.Printf("解析 customFormat 失败: %v\n", err)
+			sendFailureResult(ctx, client, queueOutName, item.TaskID, fmt.Sprintf("解析格式失败: %v", err))
+			return
+		}
+		prefixCount = strconv.Itoa(len(prefixStr))
+		suffixCount = strconv.Itoa(len(suffixStr))
+		matchingAddress = prefixStr
+		for i := 0; i < 34-len(prefixStr)-len(suffixStr); i++ {
+			matchingAddress += "X"
+		}
+		matchingAddress += suffixStr
+	} else {
+		switch item.TaskType {
+		case "5a", "6a", "7a", "8a":
+			suffixLen, err := strconv.Atoi(string(item.TaskType[0]))
+			if err != nil {
+				log.Printf("解析 taskType 失败: %v\n", err)
+				sendFailureResult(ctx, client, queueOutName, item.TaskID, fmt.Sprintf("解析 taskType 失败: %v", err))
+				return
+			}
+			suffixCount = strconv.Itoa(suffixLen)
+			prefixCount = "0"
+			matchingAddress = "./profanity.txt"
+			if _, err := os.Stat(matchingAddress); os.IsNotExist(err) {
+				log.Printf("靓号模板文件不存在\n")
+				sendFailureResult(ctx, client, queueOutName, item.TaskID, "靓号模板文件不存在")
+				return
+			}
+
+		case "custom_address":
+			log.Printf("错误: taskType=custom_address 但未提供 customFormat\n")
+			sendFailureResult(ctx, client, queueOutName, item.TaskID, "taskType=custom_address 必须提供 customFormat 字段")
+			return
+
+		default:
+			log.Printf("未知的 taskType: %s\n", item.TaskType)
+			sendFailureResult(ctx, client, queueOutName, item.TaskID, fmt.Sprintf("未知的 taskType: %s", item.TaskType))
+			return
 		}
 	}
 
-	poolSize := 10
-	if poolSizeStr := config["REDIS_POOL_SIZE"]; poolSizeStr != "" {
-		if ps, err := strconv.Atoi(poolSizeStr); err == nil {
-			poolSize = ps
-		}
-	}
+	log.Printf("生成地址参数: matching=%s, prefixCount=%s, suffixCount=%s\n", matchingAddress, prefixCount, suffixCount)
 
-	minIdleConns := 5
-	if minIdleStr := config["REDIS_MIN_IDLE_CONNS"]; minIdleStr != "" {
-		if mic, err := strconv.Atoi(minIdleStr); err == nil {
-			minIdleConns = mic
-		}
-	}
-
-	dialTimeout := parseDuration(config["REDIS_DIAL_TIMEOUT"])
-	readTimeout := parseDuration(config["REDIS_READ_TIMEOUT"])
-	writeTimeout := parseDuration(config["REDIS_WRITE_TIMEOUT"])
-
-	// 创建Redis客户端连接，添加连接池配置
-	client := redis.NewClient(&redis.Options{
-		Addr:         redisAddr,
-		Password:     redisPassword,
-		DB:           redisDB,
-		PoolSize:     poolSize,
-		MinIdleConns: minIdleConns,
-		DialTimeout:  dialTimeout,
-		ReadTimeout:  readTimeout,
-		WriteTimeout: writeTimeout,
-	})
-
-	// 测试 Redis 连接
-	ctx := context.Background()
-	if err := client.Ping(ctx).Err(); err != nil {
-		log.Printf("无法连接到 Redis, 请确认配置是否正确, 或是否加白名单, 错误信息: %v\n", err)
+	if workerState.IsCancelRequested() {
+		log.Printf("任务已被取消: TaskID=%s\n", item.TaskID)
+		sendFailureResult(ctx, client, queueOutName, item.TaskID, "任务已被用户取消")
 		return
 	}
-	log.Printf("Redis 连接成功\n")
 
-	// 初始化 Worker 状态
+	taskCtx, taskCancel := context.WithTimeout(ctx, taskTimeout)
+	defer taskCancel()
+	workerState.SetTaskCancelFunc(taskCancel)
+
+	privateKey, addr, totalGenerated, err := generateAddressByGPU(taskCtx, workerState, matchingAddress, prefixCount, suffixCount, "1")
+	if err != nil {
+		if workerState.IsCancelRequested() {
+			log.Printf("任务已被取消: TaskID=%s\n", item.TaskID)
+			sendFailureResult(ctx, client, queueOutName, item.TaskID, "任务已被用户取消")
+			return
+		}
+		log.Printf("生成地址失败: TaskID=%s, 错误: %v\n", item.TaskID, err)
+		sendFailureResult(ctx, client, queueOutName, item.TaskID, err.Error())
+		return
+	}
+
+	log.Printf("地址生成成功: TaskID=%s, %s --> %s, 生成数量: %d\n", item.TaskID, matchingAddress, addr, totalGenerated)
+
+	itemReply := ItemReply{
+		TaskID: item.TaskID,
+		Status: "completed",
+		Result: TaskResult{
+			PrivateKey:     privateKey,
+			Address:        addr,
+			TotalGenerated: totalGenerated,
+		},
+	}
+
+	jsonBytes, err := json.Marshal(itemReply)
+	if err != nil {
+		log.Printf("序列化结果失败: %v\n", err)
+		sendFailureResult(ctx, client, queueOutName, item.TaskID, fmt.Sprintf("序列化失败: %v", err))
+		return
+	}
+
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		if err := client.LPush(ctx, queueOutName, string(jsonBytes)).Err(); err != nil {
+			log.Printf("推送结果到队列失败 (尝试 %d/%d): %v\n", i+1, maxRetries, err)
+			if i < maxRetries-1 {
+				time.Sleep(time.Duration(i+1) * time.Second)
+			}
+		} else {
+			log.Printf("结果已推送到队列: %s, TaskID=%s\n", queueOutName, item.TaskID)
+			break
+		}
+	}
+}
+
+func checkGPUEnvironment() error {
+	log.Printf("检查 GPU 环境...\n")
+
+	// 1. 检查 clinfo 是否安装
+	cmd := exec.Command("which", "clinfo")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("clinfo 未安装，请先安装 OpenCL 工具:\n  apt update && apt install -y ocl-icd-libopencl1 clinfo")
+	}
+	log.Printf("✓ clinfo 已安装\n")
+
+	// 2. 检查是否能检测到 GPU 设备
+	cmd = exec.Command("clinfo")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("运行 clinfo 失败: %v\n输出: %s", err, string(output))
+	}
+
+	// 检查输出中是否包含 GPU 设备信息
+	outputStr := string(output)
+	if !strings.Contains(outputStr, "Device Name") && !strings.Contains(outputStr, "DEVICE_NAME") {
+		return fmt.Errorf("未检测到 GPU 设备，请确认:\n  1. GPU 驱动已正确安装\n  2. OpenCL 环境已配置\n  3. 运行 'clinfo' 查看详细信息")
+	}
+
+	// 提取并显示 GPU 设备名称
+	lines := strings.Split(outputStr, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "Device Name") || strings.Contains(line, "DEVICE_NAME") {
+			log.Printf("✓ 检测到 GPU: %s\n", strings.TrimSpace(line))
+			break
+		}
+	}
+
+	log.Printf("✓ GPU 环境检查通过\n")
+	return nil
+}
+
+// handleRedisWorker 处理单个 Redis 连接的任务
+func handleRedisWorker(ctx context.Context, wrapper *RedisClientWrapper, workerState *WorkerState, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	client := wrapper.Client
+	cfg := wrapper.Config
+	queueInName := "address_producer"
+	queueOutName := "address_consumer"
+
+	log.Printf("[Redis-%d] 开始监听队列: %s (地址: %s)\n", cfg.ID, queueInName, cfg.Addr)
+
+	for {
+		if workerState.IsShuttingDown() {
+			log.Printf("[Redis-%d] Worker 正在关闭，停止接收新任务\n", cfg.ID)
+			break
+		}
+
+		result, err := client.BRPop(ctx, 5*time.Second, queueInName).Result()
+		if err == redis.Nil {
+			continue
+		} else if err != nil {
+			log.Printf("[Redis-%d] 从队列获取任务失败: %v，5秒后重试\n", cfg.ID, err)
+			time.Sleep(5 * time.Second)
+			if err := client.Ping(ctx).Err(); err != nil {
+				log.Printf("[Redis-%d] Redis 连接失败: %v，继续重试\n", cfg.ID, err)
+			}
+			continue
+		}
+
+		if len(result) < 2 {
+			log.Printf("[Redis-%d] 从队列获取的数据格式错误: %v\n", cfg.ID, result)
+			continue
+		}
+		jsonStr := result[1]
+
+		var item Item
+		if err := json.Unmarshal([]byte(jsonStr), &item); err != nil {
+			log.Printf("[Redis-%d] 解析任务 JSON 失败: %v，任务数据: %s\n", cfg.ID, err, jsonStr)
+			continue
+		}
+
+		log.Printf("[Redis-%d] 收到任务: TaskID=%s, TaskType=%s, CustomFormat=%s\n", cfg.ID, item.TaskID, item.TaskType, item.CustomFormat)
+
+		isCancelled, err := client.SIsMember(ctx, "cancelled_tasks", item.TaskID).Result()
+		if err != nil {
+			log.Printf("[Redis-%d] 检查任务取消状态失败: %v\n", cfg.ID, err)
+		} else if isCancelled {
+			log.Printf("[Redis-%d] ⚠️  任务已被取消，跳过处理: TaskID=%s\n", cfg.ID, item.TaskID)
+			continue
+		}
+
+		processTask(ctx, client, workerState, item, queueOutName)
+	}
+
+	log.Printf("[Redis-%d] Worker 已停止\n", cfg.ID)
+}
+
+func server() {
+	if runtime.GOOS == "darwin" {
+		log.Printf("⚠️  macOS 开发环境，跳过 GPU 环境检查\n")
+	} else {
+		if err := checkGPUEnvironment(); err != nil {
+			log.Printf("❌ GPU 环境检查失败:\n%v\n", err)
+			log.Printf("\n请按照以下步骤配置环境:\n")
+			log.Printf("1. 安装 OpenCL 工具:\n")
+			log.Printf("   apt update && apt install -y ocl-icd-libopencl1 clinfo\n")
+			log.Printf("2. 验证 GPU:\n")
+			log.Printf("   clinfo | grep -i \"device name\"\n")
+			log.Printf("3. 如果看到 GPU 信息（如 NVIDIA GeForce RTX 4090），说明环境已配置成功\n")
+			log.Fatal("程序退出")
+		}
+	}
+
+	config := loadEnvConfig()
+	redisConfigs := parseRedisConfigs(config)
+
+	if len(redisConfigs) == 0 {
+		log.Fatal("未找到任何 Redis 配置，请检查 config.env 文件")
+	}
+
+	log.Printf("✅ 找到 %d 个 Redis 配置\n", len(redisConfigs))
+
+	ctx := context.Background()
+	var redisClients []*RedisClientWrapper
+
+	for _, cfg := range redisConfigs {
+		client := redis.NewClient(&redis.Options{
+			Addr:         cfg.Addr,
+			Password:     cfg.Password,
+			DB:           cfg.DB,
+			PoolSize:     cfg.PoolSize,
+			MinIdleConns: cfg.MinIdleConns,
+			DialTimeout:  cfg.DialTimeout,
+			ReadTimeout:  cfg.ReadTimeout,
+			WriteTimeout: cfg.WriteTimeout,
+		})
+
+		if err := client.Ping(ctx).Err(); err != nil {
+			log.Printf("❌ Redis-%d 连接失败: %s, 错误: %v\n", cfg.ID, cfg.Addr, err)
+			client.Close()
+			continue
+		}
+
+		log.Printf("✅ Redis-%d 连接成功: %s (DB: %d)\n", cfg.ID, cfg.Addr, cfg.DB)
+		redisClients = append(redisClients, &RedisClientWrapper{
+			Config: cfg,
+			Client: client,
+		})
+	}
+
+	if len(redisClients) == 0 {
+		log.Fatal("所有 Redis 连接均失败，程序退出")
+	}
+
 	hostname, err := os.Hostname()
 	if err != nil {
 		log.Printf("获取主机名失败: %v, 使用默认值\n", err)
 		hostname = "unknown"
 	}
-	// 只使用主机名作为 workerId，重启后 ID 保持不变
 	workerId := fmt.Sprintf("worker-%s", hostname)
 
 	workerState := &WorkerState{
@@ -327,81 +633,73 @@ func server() {
 	}
 
 	log.Printf("Worker 启动: %s\n", workerId)
+	log.Printf("✅ 成功连接 %d 个 Redis 实例，开始并发处理任务\n", len(redisClients))
 
-	// 定义要监听的队列名称
-	queueInName := "address_producer"
-	queueOutName := "address_consumer"
-
-	log.Printf("开始监听队列: %s\n", queueInName)
-
-	// 发送初始心跳
-	if err := sendHeartbeat(ctx, client, workerState); err != nil {
-		log.Printf("发送初始心跳失败: %v\n", err)
+	for _, wrapper := range redisClients {
+		if err := sendHeartbeat(ctx, wrapper.Client, workerState); err != nil {
+			log.Printf("[Redis-%d] 发送初始心跳失败: %v\n", wrapper.Config.ID, err)
+		}
 	}
 
-	// 定期发送心跳（每 30 秒）
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			if err := sendHeartbeat(ctx, client, workerState); err != nil {
-				log.Printf("发送心跳失败: %v\n", err)
+			for _, wrapper := range redisClients {
+				if err := sendHeartbeat(ctx, wrapper.Client, workerState); err != nil {
+					log.Printf("[Redis-%d] 发送心跳失败: %v\n", wrapper.Config.ID, err)
+				}
 			}
 		}
 	}()
 
-	// 监听任务取消通知（使用 Pub/Sub）
-	go func() {
-		// 创建 Pub/Sub 订阅
-		pubsub := client.Subscribe(ctx, "task_cancel_channel")
-		defer pubsub.Close()
+	for _, wrapper := range redisClients {
+		go func(w *RedisClientWrapper) {
+			pubsub := w.Client.Subscribe(ctx, "task_cancel_channel")
+			defer pubsub.Close()
 
-		// 等待订阅确认
-		_, err := pubsub.Receive(ctx)
-		if err != nil {
-			log.Printf("订阅取消频道失败: %v\n", err)
-			return
-		}
-		log.Printf("已订阅任务取消频道: task_cancel_channel\n")
-
-		// 获取消息频道
-		ch := pubsub.Channel()
-
-		for {
-			// 检查是否正在关闭
-			if workerState.IsShuttingDown() {
-				break
+			_, err := pubsub.Receive(ctx)
+			if err != nil {
+				log.Printf("[Redis-%d] 订阅取消频道失败: %v\n", w.Config.ID, err)
+				return
 			}
+			log.Printf("[Redis-%d] 已订阅任务取消频道: task_cancel_channel\n", w.Config.ID)
 
-			select {
-			case msg := <-ch:
-				if msg == nil {
-					continue
+			ch := pubsub.Channel()
+
+			for {
+				if workerState.IsShuttingDown() {
+					break
 				}
 
-				var cancelNotif CancelNotification
-				if err := json.Unmarshal([]byte(msg.Payload), &cancelNotif); err != nil {
-					log.Printf("解析取消通知失败: %v, 数据: %s\n", err, msg.Payload)
-					continue
-				}
-
-				if cancelNotif.Action == "cancel" {
-					log.Printf("收到任务取消通知: TaskID=%s\n", cancelNotif.TaskID)
-					if workerState.CancelCurrentTask(cancelNotif.TaskID) {
-						log.Printf("任务取消成功: TaskID=%s\n", cancelNotif.TaskID)
-					} else {
-						log.Printf("任务取消失败（可能不是当前任务）: TaskID=%s\n", cancelNotif.TaskID)
+				select {
+				case msg := <-ch:
+					if msg == nil {
+						continue
 					}
+
+					var cancelNotif CancelNotification
+					if err := json.Unmarshal([]byte(msg.Payload), &cancelNotif); err != nil {
+						log.Printf("[Redis-%d] 解析取消通知失败: %v, 数据: %s\n", w.Config.ID, err, msg.Payload)
+						continue
+					}
+
+					if cancelNotif.Action == "cancel" {
+						log.Printf("[Redis-%d] 收到任务取消通知: TaskID=%s\n", w.Config.ID, cancelNotif.TaskID)
+						if workerState.CancelCurrentTask(cancelNotif.TaskID) {
+							log.Printf("[Redis-%d] 任务取消成功: TaskID=%s\n", w.Config.ID, cancelNotif.TaskID)
+						} else {
+							log.Printf("[Redis-%d] 任务取消失败（可能不是当前任务）: TaskID=%s\n", w.Config.ID, cancelNotif.TaskID)
+						}
+					}
+
+				case <-time.After(5 * time.Second):
+					continue
 				}
-
-			case <-time.After(5 * time.Second):
-				// 定期检查是否需要退出
-				continue
 			}
-		}
-	}()
+		}(wrapper)
+	}
 
-	// 设置优雅退出信号处理
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
 
@@ -409,10 +707,8 @@ func server() {
 		sig := <-sigChan
 		log.Printf("收到退出信号: %v, 准备优雅退出...\n", sig)
 
-		// 标记为正在关闭
 		workerState.SetShuttingDown(true)
 
-		// 等待当前任务完成（最多等待 30 秒）
 		timeout := time.After(30 * time.Second)
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
@@ -433,225 +729,28 @@ func server() {
 		}
 
 	exit:
-		// 发送离线心跳
 		workerState.SetStatus(StatusOffline, nil, nil)
-		if err := sendHeartbeat(ctx, client, workerState); err != nil {
-			log.Printf("发送离线心跳失败: %v\n", err)
-		}
-
-		// 关闭 Redis 连接
-		if err := client.Close(); err != nil {
-			log.Printf("关闭 Redis 连接失败: %v\n", err)
+		for _, wrapper := range redisClients {
+			if err := sendHeartbeat(ctx, wrapper.Client, workerState); err != nil {
+				log.Printf("[Redis-%d] 发送离线心跳失败: %v\n", wrapper.Config.ID, err)
+			}
+			if err := wrapper.Client.Close(); err != nil {
+				log.Printf("[Redis-%d] 关闭 Redis 连接失败: %v\n", wrapper.Config.ID, err)
+			}
 		}
 
 		log.Printf("Worker 已安全退出\n")
 		os.Exit(0)
 	}()
 
-	for {
-		// 检查是否正在关闭
-		if workerState.IsShuttingDown() {
-			log.Printf("Worker 正在关闭，停止接收新任务\n")
-			break
-		}
-
-		// 使用 BRPop 阻塞式获取任务，超时时间 5 秒
-		// 这样比轮询 RPop + Sleep 更高效
-		result, err := client.BRPop(ctx, 5*time.Second, queueInName).Result()
-		if err == redis.Nil {
-			// 超时，继续循环
-			continue
-		} else if err != nil {
-			log.Printf("从队列获取任务失败: %v，5秒后重试\n", err)
-			time.Sleep(5 * time.Second)
-			// 尝试重连 Redis
-			if err := client.Ping(ctx).Err(); err != nil {
-				log.Printf("Redis 连接失败: %v，继续重试\n", err)
-			}
-			continue
-		}
-
-		// result[0] 是队列名，result[1] 是任务数据
-		if len(result) < 2 {
-			log.Printf("从队列获取的数据格式错误: %v\n", result)
-			continue
-		}
-		jsonStr := result[1]
-
-		// 解析任务
-		var item Item
-		if err := json.Unmarshal([]byte(jsonStr), &item); err != nil {
-			log.Printf("解析任务 JSON 失败: %v，任务数据: %s\n", err, jsonStr)
-			// 继续处理下一个任务，不退出
-			continue
-		}
-
-		log.Printf("收到任务: TaskID=%s, TaskType=%s, CustomFormat=%s\n", item.TaskID, item.TaskType, item.CustomFormat)
-
-		// 创建带超时和可取消的上下文处理任务
-		taskCtx, taskCancel := context.WithTimeout(ctx, taskTimeout)
-
-		// 使用 channel 来等待任务完成
-		done := make(chan bool, 1)
-
-		go func(item Item) {
-			defer taskCancel()
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("任务处理发生 panic: %v\n", r)
-					// 发送失败结果
-					sendFailureResult(ctx, client, queueOutName, item.TaskID, fmt.Sprintf("panic: %v", r))
-				}
-				// 恢复空闲状态
-				workerState.SetStatus(StatusIdle, nil, nil)
-				sendHeartbeat(ctx, client, workerState)
-				done <- true
-			}()
-
-			// 更新状态为忙碌
-			workerState.SetStatus(StatusBusy, &item.TaskID, &item.TaskType)
-			// 保存任务取消函数
-			workerState.SetTaskCancelFunc(taskCancel)
-			// 立即发送心跳
-			if err := sendHeartbeat(ctx, client, workerState); err != nil {
-				log.Printf("发送忙碌心跳失败: %v\n", err)
-			}
-
-			var prefixCount, suffixCount string
-			var matchingAddress string
-
-			// 优先检查是否有 customFormat
-			if item.CustomFormat != "" {
-				// 使用自定义格式
-				prefixStr, suffixStr, err := parseCustomFormat(item.CustomFormat)
-				if err != nil {
-					log.Printf("解析 customFormat 失败: %v\n", err)
-					sendFailureResult(ctx, client, queueOutName, item.TaskID, fmt.Sprintf("解析格式失败: %v", err))
-					return
-				}
-				prefixCount = strconv.Itoa(len(prefixStr))
-				suffixCount = strconv.Itoa(len(suffixStr))
-				// 构造匹配地址：Tron 地址是 34 位
-				// 格式：前缀 + 中间占位符 + 后缀
-				matchingAddress = prefixStr
-				// 中间部分用 X 占位
-				for i := 0; i < 34-len(prefixStr)-len(suffixStr); i++ {
-					matchingAddress += "X"
-				}
-				matchingAddress += suffixStr
-			} else {
-				// 根据 taskType 决定生成策略
-				switch item.TaskType {
-				case "5a", "6a", "7a", "8a":
-					// 生成后 N 位相同的地址，例如 5a 表示后5位相同
-					suffixLen, err := strconv.Atoi(string(item.TaskType[0]))
-					if err != nil {
-						log.Printf("解析 taskType 失败: %v\n", err)
-						sendFailureResult(ctx, client, queueOutName, item.TaskID, fmt.Sprintf("解析 taskType 失败: %v", err))
-						return
-					}
-					suffixCount = strconv.Itoa(suffixLen)
-					prefixCount = "0"
-					// 直接使用 profanity.txt 文件作为匹配模式
-					matchingAddress = "./profanity.txt"
-					// 检查文件是否存在
-					if _, err := os.Stat(matchingAddress); os.IsNotExist(err) {
-						log.Printf("靓号模板文件不存在\n")
-						sendFailureResult(ctx, client, queueOutName, item.TaskID, "靓号模板文件不存在")
-						return
-					}
-
-				case "custom_address":
-					// custom_address 类型必须提供 customFormat
-					log.Printf("错误: taskType=custom_address 但未提供 customFormat\n")
-					sendFailureResult(ctx, client, queueOutName, item.TaskID, "taskType=custom_address 必须提供 customFormat 字段")
-					return
-
-				default:
-					log.Printf("未知的 taskType: %s\n", item.TaskType)
-					sendFailureResult(ctx, client, queueOutName, item.TaskID, fmt.Sprintf("未知的 taskType: %s", item.TaskType))
-					return
-				}
-			}
-
-			log.Printf("生成地址参数: matching=%s, prefixCount=%s, suffixCount=%s\n", matchingAddress, prefixCount, suffixCount)
-
-			// 检查任务是否被取消
-			if workerState.IsCancelRequested() {
-				log.Printf("任务已被取消: TaskID=%s\n", item.TaskID)
-				sendFailureResult(ctx, client, queueOutName, item.TaskID, "任务已被用户取消")
-				return
-			}
-
-			// 处理任务
-			privateKey, addr, totalGenerated, err := generateAddressByGPU(taskCtx, workerState, matchingAddress, prefixCount, suffixCount, "1")
-			if err != nil {
-				// 检查是否是因为取消导致的错误
-				if workerState.IsCancelRequested() {
-					log.Printf("任务已被取消: TaskID=%s\n", item.TaskID)
-					sendFailureResult(ctx, client, queueOutName, item.TaskID, "任务已被用户取消")
-					return
-				}
-				log.Printf("生成地址失败: TaskID=%s, 错误: %v\n", item.TaskID, err)
-				sendFailureResult(ctx, client, queueOutName, item.TaskID, err.Error())
-				return
-			}
-
-			log.Printf("地址生成成功: TaskID=%s, %s --> %s, 生成数量: %d\n", item.TaskID, matchingAddress, addr, totalGenerated)
-
-			// 构建返回结果
-			itemReply := ItemReply{
-				TaskID: item.TaskID,
-				Status: "completed",
-				Result: TaskResult{
-					PrivateKey:     privateKey,
-					Address:        addr,
-					TotalGenerated: totalGenerated,
-				},
-			}
-
-			jsonBytes, err := json.Marshal(itemReply)
-			if err != nil {
-				log.Printf("序列化结果失败: %v\n", err)
-				sendFailureResult(ctx, client, queueOutName, item.TaskID, fmt.Sprintf("序列化失败: %v", err))
-				return
-			}
-
-			// 将结果推送到输出队列，带重试机制
-			maxRetries := 3
-			for i := 0; i < maxRetries; i++ {
-				if err := client.LPush(ctx, queueOutName, string(jsonBytes)).Err(); err != nil {
-					log.Printf("推送结果到队列失败 (尝试 %d/%d): %v\n", i+1, maxRetries, err)
-					if i < maxRetries-1 {
-						time.Sleep(time.Duration(i+1) * time.Second)
-					}
-				} else {
-					log.Printf("结果已推送到队列: %s, TaskID=%s\n", queueOutName, item.TaskID)
-					break
-				}
-			}
-		}(item)
-
-		// 等待任务完成或超时或取消
-		taskID := item.TaskID // 保存 taskID 用于超时日志
-		select {
-		case <-done:
-			// 任务完成
-		case <-taskCtx.Done():
-			if taskCtx.Err() == context.DeadlineExceeded {
-				log.Printf("任务处理超时: TaskID=%s, 超时时间: %v\n", taskID, taskTimeout)
-				// 发送超时失败结果
-				timeoutMsg := fmt.Sprintf("任务处理超时 > %v", taskTimeout)
-				sendFailureResult(ctx, client, queueOutName, taskID, timeoutMsg)
-			} else if taskCtx.Err() == context.Canceled {
-				// 任务被取消
-				if workerState.IsCancelRequested() {
-					log.Printf("任务已被取消: TaskID=%s\n", taskID)
-					sendFailureResult(ctx, client, queueOutName, taskID, "任务已被用户取消")
-				}
-			}
-		}
+	var wg sync.WaitGroup
+	for _, wrapper := range redisClients {
+		wg.Add(1)
+		go handleRedisWorker(ctx, wrapper, workerState, &wg)
 	}
+
+	wg.Wait()
+	log.Printf("所有 Redis Worker 已停止\n")
 }
 
 func extractValues(input string) (privateKey, address string, totalGenerated int64) {

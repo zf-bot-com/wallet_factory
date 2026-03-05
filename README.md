@@ -2,6 +2,26 @@
 
 用 golang 写的一个 Tron 靓号生成工具，支持多种条件配置，支持多协程，生成速度快，欢迎使用。
 
+## 环境要求
+
+本程序使用 GPU 进行地址生成，需要：
+
+- NVIDIA GPU（推荐 RTX 4090 或更高）
+- NVIDIA 驱动
+- OpenCL 运行时库
+
+**首次使用前，请先配置 GPU 环境：**
+
+```bash
+# 安装 OpenCL 工具
+apt update && apt install -y ocl-icd-libopencl1 clinfo
+
+# 验证 GPU
+clinfo | grep -i "device name"
+```
+
+详细配置说明请查看 [docs/GPU环境配置指南.md](docs/GPU环境配置指南.md)
+
 ## 用户文档
 
 打包后的程序包含详细的用户使用指南：
@@ -13,7 +33,28 @@
 
 ## 编译
 
-项目提供了 Makefile 来简化编译过程：
+项目提供了 Makefile 来简化编译过程，支持多环境配置。
+
+### 多环境配置
+
+项目支持在编译时指定不同的环境配置：
+
+```bash
+# 编译开发环境版本（默认，使用本地 Redis）
+make linux
+
+# 编译生产环境版本（使用远程 Redis）
+make linux ENV=prod
+
+# 其他平台
+make win ENV=prod
+make mac ENV=dev
+```
+
+详细说明请查看：
+- **[BUILD.md](BUILD.md)** - 快速参考
+- **[docs/多环境配置说明.md](docs/多环境配置说明.md)** - 详细文档
+- **[docs/多环境配置使用示例.md](docs/多环境配置使用示例.md)** - 使用示例
 
 ### 编译不同平台的可执行文件
 
@@ -31,20 +72,50 @@ make win
 
 ## 部署到服务器
 
-项目提供了自动化部署脚本，可以一键完成编译、打包、上传和 supervisor 配置。
+项目提供了自动化部署脚本，支持一次编译，批量部署到多个服务器。
 
-### 快速部署
+### 批量部署
 
 ```bash
-# 使用默认配置（服务器: gpu, 路径: /srv）
-./deploy.sh
+# 部署生产环境到所有配置的服务器
+./deploy.sh prod
 
-# 或指定服务器和路径
-./deploy.sh gpu /srv
-
-# 或使用 Makefile
-make deploy SERVER=gpu SERVER_PATH=/srv
+# 部署开发环境到所有配置的服务器
+./deploy.sh dev
 ```
+
+### 配置服务器列表
+
+编辑对应环境的服务器配置文件：
+
+```bash
+# 编辑生产环境服务器列表
+vim servers.env.prod
+```
+
+配置格式：
+
+```bash
+# 只指定服务器地址（使用默认路径 /srv）
+gpu
+worker-01
+worker-02
+
+# 或指定服务器地址和路径
+gpu:/srv
+worker-01:/home/user/trap-factory
+```
+
+### 部署流程
+
+脚本会自动完成以下步骤：
+
+1. **编译**：编译一次 Linux 版本（使用指定环境的配置）
+2. **打包**：打包一次程序文件
+3. **上传**：批量上传到所有配置的服务器
+4. **部署**：在每个服务器上解压和安装
+
+详细说明请查看 [docs/批量部署说明.md](docs/批量部署说明.md)
 
 ### 部署流程
 
@@ -52,9 +123,38 @@ make deploy SERVER=gpu SERVER_PATH=/srv
 
 1. **编译** - 执行 `make linux` 编译 Linux 版本
 2. **打包** - 执行 `make tar-linux` 打包程序
-3. **上传** - 使用 `scp` 上传到服务器指定目录
-4. **解压** - 在服务器上自动解压并设置权限
-5. **配置** - 自动配置 supervisor 并启动服务
+3. **环境检查** - 检查所有服务器的 GPU 环境
+4. **上传** - 使用 `scp` 上传到服务器指定目录
+5. **解压** - 在服务器上自动解压并设置权限
+6. **GPU 驱动预防措施** - 配置驱动锁定和监控服务（可选）
+7. **配置 Supervisor** - 自动配置 supervisor 并启动服务（可选）
+
+### GPU 驱动预防措施
+
+部署脚本会询问是否配置 GPU 驱动预防措施（推荐配置），包括：
+
+1. **安装监控脚本** - 安装 GPU 状态检测和修复脚本
+2. **锁定驱动版本** - 防止系统自动更新 NVIDIA 驱动
+3. **启用监控服务** - 自动监控 GPU 驱动状态
+4. **定期检查** - 每小时自动检查 GPU 状态
+
+配置后可以使用以下命令：
+
+```bash
+# 手动检查 GPU 状态
+ssh gpu '/usr/local/bin/check_opencl.sh'
+
+# 查看监控服务状态
+ssh gpu 'sudo systemctl status gpu-monitor.service'
+
+# 查看监控日志
+ssh gpu 'sudo journalctl -u gpu-monitor.service -f'
+
+# 查看定期检查日志
+ssh gpu 'tail -f /var/log/gpu_check.log'
+```
+
+详细说明请查看 [docs/GPU_DRIVER_MAINTENANCE.md](docs/GPU_DRIVER_MAINTENANCE.md)
 
 ### Supervisor 管理
 
