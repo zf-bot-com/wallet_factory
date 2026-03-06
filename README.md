@@ -10,7 +10,7 @@
 - NVIDIA 驱动
 - OpenCL 运行时库
 
-**首次使用前，请先配置 GPU 环境：**
+**首次使用前，请先配置 GPU 环境 (针对 Ubuntu 系统)：**
 
 ```bash
 # 安装 OpenCL 工具
@@ -53,8 +53,6 @@ make mac ENV=dev
 
 详细说明请查看：
 - **[BUILD.md](BUILD.md)** - 快速参考
-- **[docs/多环境配置说明.md](docs/多环境配置说明.md)** - 详细文档
-- **[docs/多环境配置使用示例.md](docs/多环境配置使用示例.md)** - 使用示例
 
 ### 编译不同平台的可执行文件
 
@@ -116,18 +114,6 @@ worker-01:/home/user/trap-factory
 4. **部署**：在每个服务器上解压和安装
 
 详细说明请查看 [docs/批量部署说明.md](docs/批量部署说明.md)
-
-### 部署流程
-
-脚本会自动完成以下步骤：
-
-1. **编译** - 执行 `make linux` 编译 Linux 版本
-2. **打包** - 执行 `make tar-linux` 打包程序
-3. **环境检查** - 检查所有服务器的 GPU 环境
-4. **上传** - 使用 `scp` 上传到服务器指定目录
-5. **解压** - 在服务器上自动解压并设置权限
-6. **GPU 驱动预防措施** - 配置驱动锁定和监控服务（可选）
-7. **配置 Supervisor** - 自动配置 supervisor 并启动服务（可选）
 
 ### GPU 驱动预防措施
 
@@ -250,6 +236,38 @@ ssh gpu 'sudo cp /tmp/trap-factory.conf /etc/supervisor/conf.d/ && sudo supervis
 
 作为服务器模式运行，从 Redis 队列中获取任务并处理。
 
+#### 靓号缓存系统
+
+程序内置了智能缓存系统，可以显著提升响应速度：
+
+- **后台持续生成**: profanity 在后台持续运行（quit-count=0），不断生成 6-10 位靓号存入本地 SQLite 缓存
+- **秒级响应**: 6a-9a 标准任务优先从缓存获取，命中后秒返回结果
+- **智能等待**: 缓存未命中时，任务会等待后台进程产出匹配结果
+- **GPU 独占管理**: custom_address 等特殊任务需要独占 GPU 时，自动暂停后台进程，完成后恢复
+- **私钥加密**: 所有缓存的私钥使用 AES-256-GCM 加密存储，编译时使用 garble 混淆密钥
+- **缓存上限**: 6a/7a 各缓存 1000 个，8a+ 无上限
+
+**缓存配置**（config.env）：
+
+```env
+CACHE_ENABLED=true
+CACHE_AES_KEY=8471cbaa7ba6f001cb8c30fb0f13244b14485ecde73c232568cc563e2dda8a93
+CACHE_DB_PATH=./address_cache.db
+CACHE_MAX_6A=1000
+CACHE_MAX_7A=1000
+```
+
+**日志示例**：
+
+```
+📦 缓存系统状态: true
+🚀 正在启动后台 profanity 进程...
+✅ 后台 profanity 已启动 (PID: 22521, 参数: suffix-count=6, quit-count=0)
+🎯 后台产出地址 #1: taskType=6a, address=T...888888
+💾 缓存写入成功: taskType=6a, address=T...888888
+✅ 缓存命中: TaskID=xxx, TaskType=6a, Address=T...888888
+```
+
 #### Worker 心跳机制
 
 本程序实现了完整的 Worker 心跳机制，用于与主系统进行状态同步：
@@ -262,36 +280,36 @@ ssh gpu 'sudo cp /tmp/trap-factory.conf /etc/supervisor/conf.d/ && sudo supervis
   - `offline`: 离线（准备退出）
 - **优雅退出**: 支持 SIGTERM/SIGINT 信号，会等待当前任务完成后安全退出
 
-详细的心跳机制说明请参考 [HEARTBEAT_IMPLEMENTATION.md](HEARTBEAT_IMPLEMENTATION.md)。
-
 #### 任务取消机制
 
-本程序支持通过 Redis 通知取消正在处理的任务：
+本程序支持通过 Redis Pub/Sub 实时取消正在处理的任务：
 
-- **取消队列**: `task_cancel_notifications`（Redis List）
+- **取消频道**: `task_cancel_channel`（Redis Pub/Sub）
+- **取消集合**: `cancelled_tasks`（Redis Set，用于预检查）
 - **取消通知格式**: JSON 格式，包含 action、taskId、timestamp
 - **取消时机**: 可以在任务执行的任何阶段取消
 - **取消结果**: 任务会被标记为失败，错误信息为 "任务已被用户取消"
 
-详细的取消机制说明请参考 [TASK_CANCEL_IMPLEMENTATION.md](TASK_CANCEL_IMPLEMENTATION.md)。
-
 **配置说明：**
 
-Redis 连接配置存储在 `config.env` 文件中，使用 `go:embed` 在编译时嵌入到二进制文件中。这样打包后的可执行文件包含了配置信息，无需额外的配置文件。
+Redis 连接配置存储在 `config.env` 文件中，使用 `go:embed` 在编译时嵌入到二进制文件中。
 
 **修改配置：**
 
 在编译前，编辑 `config.env` 文件：
 
 ```env
-REDIS_ADDR=144.172.76.40:16379
-REDIS_PASSWORD=fCn3XMS5bGj2Uds6
-REDIS_DB=0
-REDIS_POOL_SIZE=10
-REDIS_MIN_IDLE_CONNS=5
-REDIS_DIAL_TIMEOUT=5s
-REDIS_READ_TIMEOUT=3s
-REDIS_WRITE_TIMEOUT=3s
+# Redis 配置（支持多实例）
+REDIS_1_ADDR=127.0.0.1:6379
+REDIS_1_PASSWORD=
+REDIS_1_DB=0
+
+# 缓存配置
+CACHE_ENABLED=true
+CACHE_AES_KEY=8471cbaa7ba6f001cb8c30fb0f13244b14485ecde73c232568cc563e2dda8a93
+CACHE_DB_PATH=./address_cache.db
+CACHE_MAX_6A=1000
+CACHE_MAX_7A=1000
 ```
 
 修改后需要重新编译程序，配置才会生效。
@@ -310,11 +328,12 @@ make server
 
 **工作原理：**
 
-1. 程序从嵌入的 `config.env` 读取 Redis 连接配置
+1. 程序从嵌入的 `config.env` 读取配置
 2. 连接到 Redis 服务器
-3. 监听输入队列 `address_producer`，等待任务
-4. 处理任务并生成靓号地址
-5. 将结果推送到输出队列 `address_consumer`
+3. 如果启用缓存，启动后台 profanity 持续生成靓号
+4. 监听输入队列 `address_producer`，等待任务
+5. 优先从缓存获取结果，未命中则等待后台产出或启动专用进程
+6. 将结果推送到输出队列 `address_consumer`
 
 **任务格式（JSON）：**
 
@@ -348,22 +367,19 @@ make server
 **注意事项：**
 - 确保 Redis 服务器可访问
 - 确保 `profanity.x64`（Linux）或 `profanity.exe`（Windows）可执行文件存在
-- 确保 `profanity.txt` 文件存在（用于 `5a`/`6a`/`7a`/`8a` 任务类型）
+- 确保 `profanity.txt` 文件存在（用于标准任务类型）
 - 任务处理超时时间为 168 小时（7 天）
 - Worker 会自动发送心跳到 `worker_heartbeat` 队列
 - 支持优雅退出（Ctrl+C 或 kill 命令）
+- 缓存数据库文件 `*.db` 已加入 .gitignore
 
-**测试心跳功能：**
+**测试脚本：**
 
 ```bash
-# 运行心跳测试脚本
+# 测试心跳功能
 ./scripts/test_heartbeat.sh
-```
 
-**测试任务取消功能：**
-
-```bash
-# 运行任务取消测试脚本
+# 测试任务取消功能
 ./scripts/test_cancel.sh
 ```
 

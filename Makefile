@@ -12,17 +12,17 @@ switch-env:
 
 linux: switch-env
 	@echo "编译 Linux 版本 (环境: $(ENV))..."
-	GOOS=linux GOARCH=amd64 go build -o factory-linux main.go
+	GOOS=linux GOARCH=amd64 go build -o factory-linux .
 	@echo "✅ 编译完成: factory-linux ($(ENV))"
 
 win:
 	@echo "编译 Windows 版本 (环境: $(ENV))..."
-	GOOS=windows GOARCH=amd64 go build -o factory-win.exe main.go
+	GOOS=windows GOARCH=amd64 go build -o factory-win.exe .
 	@echo "✅ 编译完成: factory-win.exe ($(ENV))"
 
 mac:
 	@echo "编译 macOS 版本 (环境: $(ENV))..."
-	GOOS=darwin GOARCH=amd64 go build -o factory-mac main.go
+	GOOS=darwin GOARCH=amd64 go build -o factory-mac .
 	@echo "✅ 编译完成: factory-mac ($(ENV))"
 
 init:
@@ -31,10 +31,10 @@ init:
 	go mod tidy
 	
 server:
-	go run main.go server
+	go run .
 
 build:
-	go run main.go build
+	go run . build
 
 tar:
 	rm -f wallet-factory.tar.gz

@@ -5,3 +5,7 @@ config.env
 .DS_Store
 config.env.prod
 servers.env.prod
+factory-linux
+*.db
+*.db-shm
+*.db-wal

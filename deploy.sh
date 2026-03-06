@@ -129,76 +129,113 @@ ENV_CHECK_SUCCESS=0
 ENV_CHECK_FAILED=0
 ENV_FAILED_SERVERS=()
 
-if confirm "检查服务器 GPU 环境?"; then
-    for i in "${!SERVERS[@]}"; do
-        parse_server "${SERVERS[$i]}"
-        print_info "[$((i+1))/${#SERVERS[@]}] 检查 ${SERVER_ADDR} 的 GPU 环境..."
+print_info "开始检查服务器 GPU 环境..."
+for i in "${!SERVERS[@]}"; do
+    parse_server "${SERVERS[$i]}"
+    print_info "[$((i+1))/${#SERVERS[@]}] 检查 ${SERVER_ADDR} 的 GPU 环境..."
 
-        # 检查 clinfo 是否安装
-        if ssh ${SERVER_ADDR} 'which clinfo' >/dev/null 2>&1; then
-            # 检查是否能检测到 GPU
-            if ssh ${SERVER_ADDR} 'clinfo 2>/dev/null | grep -i "device name"' >/dev/null 2>&1; then
-                GPU_INFO=$(ssh ${SERVER_ADDR} 'clinfo 2>/dev/null | grep -i "device name" | head -1')
-                print_success "环境正常: ${SERVER_ADDR} - ${GPU_INFO}"
-                ((ENV_CHECK_SUCCESS++))
-            else
-                print_error "未检测到 GPU: ${SERVER_ADDR}"
-                ((ENV_CHECK_FAILED++))
-                ENV_FAILED_SERVERS+=("${SERVER_ADDR}")
+    # 检查 clinfo 是否安装
+    if ssh ${SERVER_ADDR} 'which clinfo' >/dev/null 2>&1; then
+        # 检查是否能检测到 GPU
+        if ssh ${SERVER_ADDR} 'clinfo 2>/dev/null | grep -i "device name"' >/dev/null 2>&1; then
+            print_success "环境正常: ${SERVER_ADDR}"
+
+            # 获取详细的 GPU 信息
+            echo ""
+            echo "  GPU 环境详情："
+
+            # GPU 数量和型号
+            GPU_COUNT=$(ssh ${SERVER_ADDR} 'clinfo 2>/dev/null | grep -i "Device Name" | wc -l')
+            GPU_MODEL=$(ssh ${SERVER_ADDR} 'clinfo 2>/dev/null | grep -i "Device Name" | head -1 | sed "s/.*Device Name[[:space:]]*//g"')
+            echo "  - GPU 数量: ${GPU_COUNT} 块 ${GPU_MODEL}"
+
+            # 驱动版本
+            if ssh ${SERVER_ADDR} 'which nvidia-smi' >/dev/null 2>&1; then
+                DRIVER_VERSION=$(ssh ${SERVER_ADDR} 'nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1')
+                echo "  - 驱动版本: ${DRIVER_VERSION}"
+
+                # GPU 状态信息（温度、利用率、显存）
+                GPU_STATUS=$(ssh ${SERVER_ADDR} 'nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits')
+
+                # 解析第一块 GPU 的状态
+                FIRST_GPU=$(echo "$GPU_STATUS" | head -1)
+                TEMP=$(echo "$FIRST_GPU" | awk -F',' '{print $1}')
+                UTIL=$(echo "$FIRST_GPU" | awk -F',' '{print $2}')
+                MEM_USED=$(echo "$FIRST_GPU" | awk -F',' '{print $3}')
+                MEM_TOTAL=$(echo "$FIRST_GPU" | awk -F',' '{print $4}')
+
+                echo "  - GPU 利用率: ${UTIL}%"
+                echo "  - GPU 温度: ${TEMP}°C"
+                echo "  - 显存使用: ${MEM_USED} MiB / ${MEM_TOTAL} MiB"
+
+                # 检查是否有 profanity 进程在运行
+                if ssh ${SERVER_ADDR} 'pgrep -f profanity' >/dev/null 2>&1; then
+                    echo "  - 状态: profanity 正在运行"
+                else
+                    echo "  - 状态: profanity 未运行"
+                fi
             fi
+
+            # OpenCL 状态
+            echo "  - OpenCL: 正常工作"
+            echo ""
+
+            ((ENV_CHECK_SUCCESS++))
         else
-            print_warning "clinfo 未安装: ${SERVER_ADDR}"
+            print_error "未检测到 GPU: ${SERVER_ADDR}"
             ((ENV_CHECK_FAILED++))
             ENV_FAILED_SERVERS+=("${SERVER_ADDR}")
         fi
+    else
+        print_warning "clinfo 未安装: ${SERVER_ADDR}"
+        ((ENV_CHECK_FAILED++))
+        ENV_FAILED_SERVERS+=("${SERVER_ADDR}")
+    fi
+done
+
+echo ""
+print_info "环境检查统计: 正常 ${ENV_CHECK_SUCCESS}, 异常 ${ENV_CHECK_FAILED}"
+
+if [ ${ENV_CHECK_FAILED} -gt 0 ]; then
+    print_warning "以下服务器环境异常:"
+    for server in "${ENV_FAILED_SERVERS[@]}"; do
+        echo "  - ${server}"
     done
-
     echo ""
-    print_info "环境检查统计: 正常 ${ENV_CHECK_SUCCESS}, 异常 ${ENV_CHECK_FAILED}"
-
-    if [ ${ENV_CHECK_FAILED} -gt 0 ]; then
-        print_warning "以下服务器环境异常:"
+    print_info "修复方法:"
+    echo "  ssh <服务器> 'apt update && apt install -y ocl-icd-libopencl1 clinfo'"
+    echo ""
+    if confirm "自动修复环境异常的服务器?"; then
+        print_info "开始自动修复环境..."
         for server in "${ENV_FAILED_SERVERS[@]}"; do
-            echo "  - ${server}"
+            print_info "修复 ${server}..."
+            if ssh ${server} 'apt update && apt install -y ocl-icd-libopencl1 clinfo' 2>/dev/null; then
+                print_success "修复成功: ${server}"
+            else
+                print_error "修复失败: ${server}"
+            fi
         done
         echo ""
-        print_info "修复方法:"
-        echo "  ssh <服务器> 'apt update && apt install -y ocl-icd-libopencl1 clinfo'"
-        echo ""
-        if confirm "自动修复环境异常的服务器?"; then
-            print_info "开始自动修复环境..."
-            for server in "${ENV_FAILED_SERVERS[@]}"; do
-                print_info "修复 ${server}..."
-                if ssh ${server} 'apt update && apt install -y ocl-icd-libopencl1 clinfo' 2>/dev/null; then
-                    print_success "修复成功: ${server}"
-                else
-                    print_error "修复失败: ${server}"
-                fi
-            done
-            echo ""
-            print_info "重新检查环境..."
-            ENV_CHECK_FAILED=0
-            ENV_FAILED_SERVERS=()
-            for i in "${!SERVERS[@]}"; do
-                parse_server "${SERVERS[$i]}"
-                if ! ssh ${SERVER_ADDR} 'which clinfo && clinfo 2>/dev/null | grep -i "device name"' >/dev/null 2>&1; then
-                    ((ENV_CHECK_FAILED++))
-                    ENV_FAILED_SERVERS+=("${SERVER_ADDR}")
-                fi
-            done
-            if [ ${ENV_CHECK_FAILED} -gt 0 ]; then
-                print_error "仍有 ${ENV_CHECK_FAILED} 个服务器环境异常"
-                print_warning "请手动修复后再部署"
-                exit 1
-            else
-                print_success "所有服务器环境已修复"
+        print_info "重新检查环境..."
+        ENV_CHECK_FAILED=0
+        ENV_FAILED_SERVERS=()
+        for i in "${!SERVERS[@]}"; do
+            parse_server "${SERVERS[$i]}"
+            if ! ssh ${SERVER_ADDR} 'which clinfo && clinfo 2>/dev/null | grep -i "device name"' >/dev/null 2>&1; then
+                ((ENV_CHECK_FAILED++))
+                ENV_FAILED_SERVERS+=("${SERVER_ADDR}")
             fi
+        done
+        if [ ${ENV_CHECK_FAILED} -gt 0 ]; then
+            print_error "仍有 ${ENV_CHECK_FAILED} 个服务器环境异常"
+            print_warning "请手动修复后再部署"
+            exit 1
         else
-            print_info "跳过自动修复"
+            print_success "所有服务器环境已修复"
         fi
+    else
+        print_info "跳过自动修复"
     fi
-else
-    print_info "跳过 GPU 环境检查"
 fi
 echo ""
 
