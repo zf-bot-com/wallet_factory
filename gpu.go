@@ -171,21 +171,23 @@ func checkGPUEnvironment() error {
 
 // GPUManager GPU 独占管理器
 type GPUManager struct {
-	mu         sync.Mutex
-	bgCmd      *exec.Cmd
-	bgCancel   context.CancelFunc
-	bgRunning  bool
-	bgCtx      context.Context // 保存 context 用于自动重启
-	onResult   func(AddressResult) // 后台产出回调
-	cache      *AddressCache
-	waiterMgr  *WaiterManager
+	mu            sync.Mutex
+	bgCmd         *exec.Cmd
+	bgCancel      context.CancelFunc
+	bgRunning     bool
+	bgCtx         context.Context // 保存 context 用于自动重启
+	onResult      func(AddressResult) // 后台产出回调
+	cache         *AddressCache
+	waiterMgr     *WaiterManager
+	cacheFullWarn map[string]bool // 记录每个 taskType 是否已警告过缓存已满
 }
 
 // NewGPUManager 创建 GPU 管理器
 func NewGPUManager(cache *AddressCache, waiterMgr *WaiterManager) *GPUManager {
 	return &GPUManager{
-		cache:     cache,
-		waiterMgr: waiterMgr,
+		cache:         cache,
+		waiterMgr:     waiterMgr,
+		cacheFullWarn: make(map[string]bool),
 	}
 }
 
@@ -331,7 +333,28 @@ func (gm *GPUManager) readBackgroundOutput(stdout io.ReadCloser) {
 				continue // 不符合缓存条件
 			}
 
-			// 获取当前数据库总数
+			// 优先检查是否有等待者
+			hasWaiter := gm.waiterMgr.HasWaiter(taskType)
+
+			// 检查缓存是否已满
+			cacheFull := !gm.cache.ShouldCache(taskType)
+
+			// 如果缓存已满且没有等待者，直接跳过（不输出任何日志）
+			if cacheFull && !hasWaiter {
+				// 只在第一次检测到缓存已满时打印警告
+				if !gm.cacheFullWarn[taskType] {
+					log.Printf("⚠️  缓存已满，跳过: taskType=%s\n", taskType)
+					gm.cacheFullWarn[taskType] = true
+				}
+				continue
+			}
+
+			// 如果缓存有空间了，重置警告标志
+			if !cacheFull && gm.cacheFullWarn[taskType] {
+				gm.cacheFullWarn[taskType] = false
+			}
+
+			// 输出产出日志（只有在有等待者或缓存未满时才输出）
 			totalCount := gm.cache.GetTotalCount()
 			log.Printf("🎯 后台产出地址 #%d: taskType=%s, address=%s\n", totalCount+1, taskType, result.Address)
 
@@ -341,9 +364,8 @@ func (gm *GPUManager) readBackgroundOutput(stdout io.ReadCloser) {
 				continue
 			}
 
-			// 检查是否应该缓存
-			if !gm.cache.ShouldCache(taskType) {
-				log.Printf("⚠️  缓存已满，跳过: taskType=%s\n", taskType)
+			// 如果缓存已满，这里不应该到达（因为前面已经检查过了）
+			if cacheFull {
 				continue
 			}
 

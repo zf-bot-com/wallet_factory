@@ -386,6 +386,13 @@ func (wm *WaiterManager) TryDeliver(taskType string, result *AddressResult) bool
 	}
 }
 
+// HasWaiter 检查是否有等待者
+func (wm *WaiterManager) HasWaiter(taskType string) bool {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+	return len(wm.waiters[taskType]) > 0
+}
+
 // classifyAddress 分析地址后缀，返回任务类型（如 "6a", "8a"）
 func classifyAddress(address string) string {
 	if len(address) == 0 {
